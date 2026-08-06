@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Agent artifacts
+.codetest/
+
+# Gradle / Java (sample project)
+.gradle/
+sample-springboot/build/
+sample-springboot/.gradle/
