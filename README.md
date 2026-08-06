@@ -1,42 +1,103 @@
-# codetest-mcp — AST & Linter MCP Server
+# codetest-mcp — 코드 기반 처리 전담 FastAPI 서비스
 
-정의서의 **이중 검증 분석기** 중 "정통적 오류" 축을 담당하는 MCP(stdio) 서버입니다.
+정의서:
 
-> 정통적 오류(문법, 타입, 오탈자, 잘못된 변수 사용):
-> **AST & Linter MCP가 Headless 모드로 실행하여 100% 팩트 기반 검출.**
+> LLM을 사용하여 판단하는 부분은 Agent, **코드 기반으로 단순 처리 및 판단을 진행하는
+> 부분은 MCP** 로 구분하여 Fast API를 통해 송/수신하는 방식으로 구현
 
-## 제공 도구 (MCP Tools)
+이 서비스는 **LLM 을 전혀 호출하지 않는다.** 파서와 빌드 도구가 확정한 사실만 만들어
+Agent 에게 돌려준다.
 
-| 도구 | 설명 |
+## 담당 기능 (전부 정의서 근거)
+
+| 기능 | 정의서 근거 |
 |---|---|
-| `ast_check` | Tree-sitter 파스 트리의 `ERROR`/`MISSING` 노드, Python `compile()` SyntaxError 를 검출 |
-| `lint_check` | 설치된 실제 린터(`ruff`, `eslint`)를 Headless 로 실행. 없으면 내장 결정적 규칙으로 폴백 |
-| `health` | 서버 상태 및 사용 가능한 린터/문법 목록 |
+| Git clone + AST 파싱 → 프로젝트 개요 DB 저장 | [상세] 1 |
+| Git Diff + AST 로 변경된 코드 단위 식별 | (2) |
+| 변경 영향도 / 메소드 추적 | 흐름 3 |
+| 생성된 Test Code 에 `@SpringBootTest` 주입 | (1) |
+| Gradle + JaCoCo 로 Test Code 실행 | [상세] 4 |
 
-모든 도구는 동일한 입력/출력 스키마를 씁니다.
+**하지 않는 것**: 변경 의도 해석, 중요도 판정, 테스트 코드 작성, 결과 적절성 판단
+— 전부 Agent(LLM)의 몫이다.
+
+## API
+
+| 메서드 | 경로 | 설명 |
+|---|---|---|
+| `GET` | `/api/v1/health` | 헬스체크 (인증 불필요) |
+| `POST` | `/api/v1/projects` | 프로젝트 등록 + 개요 수집(백그라운드) |
+| `DELETE` | `/api/v1/projects/{id}` | 프로젝트·그래프·작업 사본 삭제 |
+| `GET` | `/api/v1/projects/{id}/overview` | 저장된 개요 조회 |
+| `POST` | `/api/v1/analysis/changes` | Diff + AST 변경 단위·영향도 식별 |
+| `POST` | `/api/v1/tests/execute` | `@SpringBootTest` 주입 + JaCoCo 실행 |
+
+### `/api/v1/analysis/changes`
 
 ```jsonc
-// 입력
-{ "files": [ { "path": "src/A.java", "content": "...", "language": "java" } ] }
+// 요청
+{ "project_id": "…", "diff": "<unified diff>", "sources": [{"path": "…", "content": "…"}] }
 
-// 출력
-{ "findings": [
-    { "file_path": "src/A.java", "line": 42, "severity": "error",
-      "rule": "ast-parse-error", "message": "...", "source": "ast" }
-] }
+// 응답 — 확정된 사실만
+{
+  "changed_units":  [{"qualified_name": "com.example.demo.service.OrderService#calculateTotal(Order)",
+                      "node_type": "Method", "start_line": 6, "end_line": 12, "entrypoint": false}],
+  "impacted_units": [{"qualified_name": "…", "depth": 1, "via": "Calls"}],
+  "risk": "MEDIUM", "risk_score": 30, "risk_reasons": ["직접 변경된 그래프 노드 1개 …"],
+  "frameworks": ["Spring Boot"], "base_package": "com.example.demo",
+  "graph_ready": true, "warnings": []
+}
+```
+
+### `/api/v1/tests/execute`
+
+`test_code` 에 `@SpringBootTest` 가 없으면 **주입한 뒤** 실행한다. 필요한 import 와
+`package` 선언도 보강하고, `src/test/java/<package>/<Class>.java` 로 저장해 돌린다.
+클라이언트가 보낸 `sources`(미커밋 변경분)를 작업 사본에 덮어쓴 뒤 실행하므로
+개발자의 로컬 변경이 실제로 테스트된다. 실행이 끝나면 작업 사본을 원상 복구한다.
+
+```jsonc
+// 응답 — 판정 없이 사실만
+{
+  "exit_code": 0, "passed": 3, "failed": 0, "total": 3, "failures": [],
+  "coverage": {"line_rate": 80.0, "branch_rate": 100.0, "line_covered": 16, "line_missed": 4},
+  "jacoco_enabled": true, "springboot_applied": true,
+  "applied": ["@SpringBootTest 주입 (class GeneratedOrderTest)", "import 보강: …"],
+  "test_file_path": "src/test/java/com/example/demo/GeneratedOrderTest.java",
+  "command": ["sh", "./gradlew", "test", "--tests", "…", "jacocoTestReport"]
+}
 ```
 
 ## 실행
 
 ```bash
 pip install -e .
-python -m codetest_mcp.server     # stdio 모드
+uvicorn codetest_mcp.main:app --host 0.0.0.0 --port 8100
+# 또는
+python -m codetest_mcp
 ```
 
-agent-server 가 `CODETEST_MCP_COMMAND` / `CODETEST_MCP_ARGS` 설정으로 이 서버를
-stdio 자식 프로세스로 기동합니다. 별도로 띄울 필요는 없고, 단독 실행은 디버깅 용도입니다.
+### 환경변수
+
+| 변수 | 기본값 | 설명 |
+|---|---|---|
+| `CODETEST_MCP_PORT` | `8100` | 수신 포트 |
+| `CODETEST_MCP_API_KEYS` | (없음) | Agent 인증 키(CSV). 비우면 인증 비활성화 |
+| `CODETEST_MCP_DATABASE_URL` | `sqlite:///./data/codetest_mcp.db` | 개요/그래프 저장소 |
+| `CODETEST_MCP_WORKSPACE_DIR` | `./workspace` | 대상 저장소 clone 위치 |
+| `CODETEST_MCP_GRADLE_COMMAND` | `gradle` | `gradlew` 가 없을 때 쓸 실행 파일 |
+| `CODETEST_MCP_TEST_TIMEOUT` | `900` | gradle test 최대 실행 시간(초) |
+
+대상 프로젝트에 `gradlew` 가 있으면 우선 사용한다. JaCoCo 커버리지는 프로젝트
+`build.gradle` 에 `jacoco` 플러그인이 적용되어 있을 때만 수집된다.
+
+## 테스트
+
+```bash
+python -m pytest tests/ -q
+```
 
 ## 배포 위치
 
-**별도 관리 서버** — agent-server 와 같은 호스트에 배치합니다
-(stdio 로 통신하므로 동일 머신에 있어야 합니다).
+Agent 와 동일한 **별도 관리 서버**. Agent 가 FastAPI 로 호출한다.
+대상 저장소를 clone 하고 Gradle 을 실행하므로 JDK 와 Gradle 이 필요하다.

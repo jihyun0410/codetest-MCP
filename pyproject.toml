@@ -1,22 +1,37 @@
 [project]
 name = "codetest-mcp"
 version = "0.1.0"
-description = "Code Review AI Agent - AST & Linter MCP Server (Headless)"
+description = "Code Test AI Agent - MCP (코드 기반 처리 전담 FastAPI 서비스)"
 requires-python = ">=3.10"
 
 dependencies = [
-    "mcp>=1.2",
+    # --- REST API (Agent 와 FastAPI 로 송/수신) ---
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+
+    # --- 프로젝트 개요 DB (Project, Graph Node/Edge) ---
+    "SQLAlchemy>=2.0",
+
+    # --- 저장소 clone ---
+    "GitPython>=3.1",
+
+    # --- AST 파싱 (LLM 토큰 미소모) ---
     "tree-sitter>=0.22",
-    "tree-sitter-language-pack>=0.2",
+    "tree-sitter-language-pack>=0.2",  # Java/JS/TS/Python/XML/SQL 문법 번들
+    "lxml>=5.2",                       # MyBatis XML 파싱
 ]
 
 [project.optional-dependencies]
-# 실제 린터가 설치되어 있으면 자동으로 사용한다 (없으면 내장 규칙으로 폴백)
-linters = ["ruff>=0.5"]
-dev = ["pytest>=8.0"]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",   # fastapi TestClient
+    "ruff>=0.5",
+]
 
 [project.scripts]
-codetest-mcp = "codetest_mcp.server:main"
+codetest-mcp = "codetest_mcp.__main__:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -24,3 +39,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["codetest_mcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
