@@ -1,12 +1,12 @@
-# codetest-mcp — 코드 기반 처리 전담 FastAPI 서비스
+# codetest-mcp — 코드 기반 처리 전담 MCP 서버
 
 정의서:
 
 > LLM을 사용하여 판단하는 부분은 Agent, **코드 기반으로 단순 처리 및 판단을 진행하는
-> 부분은 MCP** 로 구분하여 Fast API를 통해 송/수신하는 방식으로 구현
+> 부분은 MCP** 로 구분
 
-이 서비스는 **LLM 을 전혀 호출하지 않는다.** 파서와 빌드 도구가 확정한 사실만 만들어
-Agent 에게 돌려준다.
+이 서버는 **LLM 을 전혀 호출하지 않는다.** 파서와 빌드 도구가 확정한 사실만 만들어
+Agent 에게 돌려준다. Agent 는 MCP 클라이언트로 붙어 도구를 호출한다.
 
 ## 담당 기능 (전부 정의서 근거)
 
@@ -21,23 +21,20 @@ Agent 에게 돌려준다.
 **하지 않는 것**: 변경 의도 해석, 중요도 판정, 테스트 코드 작성, 결과 적절성 판단
 — 전부 Agent(LLM)의 몫이다.
 
-## API
+## 도구 (`@mcp.tool`)
 
-| 메서드 | 경로 | 설명 |
-|---|---|---|
-| `GET` | `/api/v1/health` | 헬스체크 (인증 불필요) |
-| `POST` | `/api/v1/projects` | 프로젝트 등록 + 개요 수집(백그라운드) |
-| `DELETE` | `/api/v1/projects/{id}` | 프로젝트·그래프·작업 사본 삭제 |
-| `GET` | `/api/v1/projects/{id}/overview` | 저장된 개요 조회 |
-| `POST` | `/api/v1/analysis/changes` | Diff + AST 변경 단위·영향도 식별 |
-| `POST` | `/api/v1/tests/execute` | `@SpringBootTest` 주입 + JaCoCo 실행 |
+| 도구 | 설명 |
+|---|---|
+| `hello` | 연결 확인용 에코 |
+| `register_project` | 프로젝트 등록 + 개요 수집(백그라운드) |
+| `delete_project` | 프로젝트·그래프·작업 사본 삭제 |
+| `get_project_overview` | 저장된 개요 조회 |
+| `analyze_changes` | Diff + AST 변경 단위·영향도 식별 |
+| `execute_tests` | `@SpringBootTest` 주입 + JaCoCo 실행 |
 
-### `/api/v1/analysis/changes`
+### `analyze_changes(project_id, diff)`
 
 ```jsonc
-// 요청
-{ "project_id": "…", "diff": "<unified diff>", "sources": [{"path": "…", "content": "…"}] }
-
 // 응답 — 확정된 사실만
 {
   "changed_units":  [{"qualified_name": "com.example.demo.service.OrderService#calculateTotal(Order)",
@@ -49,12 +46,12 @@ Agent 에게 돌려준다.
 }
 ```
 
-### `/api/v1/tests/execute`
+### `execute_tests(project_id, test_code, sources, base_package)`
 
 `test_code` 에 `@SpringBootTest` 가 없으면 **주입한 뒤** 실행한다. 필요한 import 와
 `package` 선언도 보강하고, `src/test/java/<package>/<Class>.java` 로 저장해 돌린다.
-클라이언트가 보낸 `sources`(미커밋 변경분)를 작업 사본에 덮어쓴 뒤 실행하므로
-개발자의 로컬 변경이 실제로 테스트된다. 실행이 끝나면 작업 사본을 원상 복구한다.
+`sources`(미커밋 변경분)를 작업 사본에 덮어쓴 뒤 실행하므로 개발자의 로컬 변경이
+실제로 테스트된다. 실행이 끝나면 작업 사본을 원상 복구한다.
 
 ```jsonc
 // 응답 — 판정 없이 사실만
@@ -72,21 +69,39 @@ Agent 에게 돌려준다.
 
 ```bash
 pip install -e .
-uvicorn codetest_mcp.main:app --host 0.0.0.0 --port 8100
-# 또는
-python -m codetest_mcp
+python -m codetest_mcp     # 기본: streamable-http, 0.0.0.0:80
+```
+
+### Agent 쪽 등록
+
+```jsonc
+// http — 별도 서버로 띄운 경우
+{"mcpServers": {"codetest": {
+  "url": "http://<host>:80/mcp",
+  "headers": {"X-API-Key": "…"}
+}}}
+
+// stdio — Agent 가 자식 프로세스로 띄우는 경우
+{"mcpServers": {"codetest": {
+  "command": "python", "args": ["-m", "codetest_mcp"],
+  "env": {"CODETEST_MCP_TRANSPORT": "stdio"}
+}}}
 ```
 
 ### 환경변수
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `CODETEST_MCP_PORT` | `8100` | 수신 포트 |
+| `CODETEST_MCP_TRANSPORT` | `streamable-http` | `streamable-http` 또는 `stdio` |
+| `CODETEST_MCP_PORT` | `80` | 수신 포트. root 아니면 `8100` 등으로 바꿀 것 |
 | `CODETEST_MCP_API_KEYS` | (없음) | Agent 인증 키(CSV). 비우면 인증 비활성화 |
 | `CODETEST_MCP_DATABASE_URL` | `sqlite:///./data/codetest_mcp.db` | 개요/그래프 저장소 |
 | `CODETEST_MCP_WORKSPACE_DIR` | `./workspace` | 대상 저장소 clone 위치 |
 | `CODETEST_MCP_GRADLE_COMMAND` | `gradle` | `gradlew` 가 없을 때 쓸 실행 파일 |
 | `CODETEST_MCP_TEST_TIMEOUT` | `900` | gradle test 최대 실행 시간(초) |
+
+API Key 는 **http 전송일 때만** 검사한다 (`X-API-Key` 헤더). stdio 는 Agent 가 이
+서버를 자식 프로세스로 띄운 것이라 신뢰 경계가 아니다.
 
 대상 프로젝트에 `gradlew` 가 있으면 우선 사용한다. JaCoCo 커버리지는 프로젝트
 `build.gradle` 에 `jacoco` 플러그인이 적용되어 있을 때만 수집된다.
@@ -99,5 +114,5 @@ python -m pytest tests/ -q
 
 ## 배포 위치
 
-Agent 와 동일한 **별도 관리 서버**. Agent 가 FastAPI 로 호출한다.
-대상 저장소를 clone 하고 Gradle 을 실행하므로 JDK 와 Gradle 이 필요하다.
+Agent 와 동일한 **별도 관리 서버**. 대상 저장소를 clone 하고 Gradle 을 실행하므로
+JDK 와 Gradle 이 필요하다.

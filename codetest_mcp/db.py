@@ -13,6 +13,7 @@ from __future__ import annotations
 import enum
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -213,8 +214,9 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
 
 
-def get_db() -> Iterator[Session]:
-    """FastAPI 의존성: 요청 단위 세션."""
+@contextmanager
+def session_scope() -> Iterator[Session]:
+    """도구 호출 단위 세션."""
     db = SessionLocal()
     try:
         yield db

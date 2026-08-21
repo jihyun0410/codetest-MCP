@@ -1,6 +1,7 @@
-"""MCP REST 요청/응답 스키마.
+"""MCP 도구 응답 스키마.
 
-Agent(LLM 서비스)가 FastAPI 로 호출하는 계약이다.
+Agent(LLM 서비스)가 MCP 로 호출하는 계약이다. 요청 파라미터는 도구 시그니처가
+그대로 JSON Schema 가 되므로 여기엔 없다.
 모든 응답은 **코드로 확정한 사실**만 담는다 — 추론/판정 필드는 없다.
 """
 
@@ -8,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class SourceFilePayload(BaseModel):
@@ -17,23 +18,8 @@ class SourceFilePayload(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-#  POST /api/v1/projects  — 프로젝트 개요 수집 (정의서 상세 1)
+#  register_project / get_project_overview — 프로젝트 개요 (정의서 상세 1)
 # ---------------------------------------------------------------------------
-class ProjectCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200, description="프로젝트 명")
-    git_url: str = Field(..., description="대상 저장소 Git URL")
-    owner: str = Field(..., min_length=1, max_length=100, description="담당자")
-    github_token: str | None = Field(default=None, description="Github API Token")
-    default_branch: str = Field(default="main", description="기준 브랜치")
-
-    @field_validator("git_url")
-    @classmethod
-    def _validate_git_url(cls, v: str) -> str:
-        if not v.startswith(("http://", "https://", "git@")):
-            raise ValueError("git_url 은 http(s):// 또는 git@ 형식이어야 합니다.")
-        return v.rstrip("/")
-
-
 class ProjectRead(BaseModel):
     """github_token 은 보유 여부만 노출한다."""
 
@@ -71,16 +57,8 @@ class OverviewResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-#  POST /api/v1/analysis/changes — Git Diff + AST 변경 단위 식별 (정의서 (2))
+#  analyze_changes — Git Diff + AST 변경 단위 식별 (정의서 (2))
 # ---------------------------------------------------------------------------
-class ChangeAnalysisRequest(BaseModel):
-    project_id: str
-    #: 변경분 unified diff
-    diff: str = ""
-    #: 변경 파일 본문 (그래프에 없는 신규 파일도 파싱하기 위함)
-    sources: list[SourceFilePayload] = Field(default_factory=list)
-
-
 class ChangedUnit(BaseModel):
     """Diff 라인과 겹치는 것으로 확정된 코드 단위."""
 
@@ -130,18 +108,8 @@ class ChangeAnalysisResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-#  POST /api/v1/tests/execute — @SpringBootTest + JaCoCo 실행 (정의서 상세 4)
+#  execute_tests — @SpringBootTest + JaCoCo 실행 (정의서 상세 4)
 # ---------------------------------------------------------------------------
-class ExecuteRequest(BaseModel):
-    project_id: str
-    #: Agent(LLM)가 생성한 Java 테스트 소스
-    test_code: str
-    #: 실행 전에 작업 사본에 덮어쓸 변경 파일 (개발자의 미커밋 변경)
-    sources: list[SourceFilePayload] = Field(default_factory=list)
-    #: package 선언이 없을 때 사용할 기준 패키지. 생략하면 개요에서 찾는다.
-    base_package: str | None = None
-
-
 class ExecuteResponse(BaseModel):
     """실행 사실만 담는다. 적절성 판정은 Agent 가 한다."""
 

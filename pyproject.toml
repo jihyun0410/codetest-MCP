@@ -1,13 +1,12 @@
 [project]
 name = "codetest-mcp"
 version = "0.1.0"
-description = "Code Test AI Agent - MCP (코드 기반 처리 전담 FastAPI 서비스)"
+description = "Code Test AI Agent - MCP (코드 기반 처리 전담 MCP 서버)"
 requires-python = ">=3.10"
 
 dependencies = [
-    # --- REST API (Agent 와 FastAPI 로 송/수신) ---
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
+    # --- MCP 서버 (Agent 가 MCP 클라이언트로 호출) ---
+    "fastmcp>=3.0",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
 
@@ -26,7 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "httpx>=0.27",   # fastapi TestClient
+    "pytest-asyncio>=0.24",
     "ruff>=0.5",
 ]
 
@@ -42,3 +41,4 @@ include = ["codetest_mcp*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
