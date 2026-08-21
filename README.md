@@ -69,7 +69,7 @@ Agent 에게 돌려준다. Agent 는 MCP 클라이언트로 붙어 도구를 호
 
 ```bash
 pip install -e .
-python -m codetest_mcp     # 기본: streamable-http, 0.0.0.0:80
+python -m src     # 기본: http(streamable), 0.0.0.0:8100
 ```
 
 ### Agent 쪽 등록
@@ -77,13 +77,13 @@ python -m codetest_mcp     # 기본: streamable-http, 0.0.0.0:80
 ```jsonc
 // http — 별도 서버로 띄운 경우
 {"mcpServers": {"codetest": {
-  "url": "http://<host>:80/mcp",
+  "url": "http://<서비스명>/mcp",     // Service:80 -> container:8100
   "headers": {"X-API-Key": "…"}
 }}}
 
 // stdio — Agent 가 자식 프로세스로 띄우는 경우
 {"mcpServers": {"codetest": {
-  "command": "python", "args": ["-m", "codetest_mcp"],
+  "command": "python", "args": ["-m", "src"],
   "env": {"CODETEST_MCP_TRANSPORT": "stdio"}
 }}}
 ```
@@ -92,8 +92,8 @@ python -m codetest_mcp     # 기본: streamable-http, 0.0.0.0:80
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `CODETEST_MCP_TRANSPORT` | `streamable-http` | `streamable-http` 또는 `stdio` |
-| `CODETEST_MCP_PORT` | `80` | 수신 포트. root 아니면 `8100` 등으로 바꿀 것 |
+| `CODETEST_MCP_TRANSPORT` | `http` | `http`(=streamable-http) 또는 `stdio` |
+| `CODETEST_MCP_PORT` | `8100` | 수신 포트 (Service 80 -> targetPort http) |
 | `CODETEST_MCP_API_KEYS` | (없음) | Agent 인증 키(CSV). 비우면 인증 비활성화 |
 | `CODETEST_MCP_DATABASE_URL` | `sqlite:///./data/codetest_mcp.db` | 개요/그래프 저장소 |
 | `CODETEST_MCP_WORKSPACE_DIR` | `./workspace` | 대상 저장소 clone 위치 |

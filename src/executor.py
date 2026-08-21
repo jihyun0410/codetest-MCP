@@ -24,8 +24,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from codetest_mcp.config import get_logger, settings
-from codetest_mcp.springboot import PreparedTest
+from src.config import get_logger, settings
+from src.springboot import PreparedTest
 
 logger = get_logger(__name__)
 

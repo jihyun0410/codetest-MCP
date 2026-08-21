@@ -17,8 +17,8 @@ import re
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
-from codetest_mcp.db import EdgeType, GraphEdge, GraphNode, NodeType, RiskLevel
-from codetest_mcp.graph.store import GraphStore
+from src.db import EdgeType, GraphEdge, GraphNode, NodeType, RiskLevel
+from src.graph.store import GraphStore
 
 #: 영향 전파를 추적할 최대 깊이. Tier 3 컨텍스트 경계와 맞춘다.
 DEFAULT_MAX_DEPTH = 3

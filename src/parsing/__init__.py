@@ -1,7 +1,7 @@
 """AST 파싱 패키지 (Tree-sitter 중심, LLM 토큰 미소모)."""
 
-from codetest_mcp.parsing.base import ParsedEdge, ParsedNode, ParseResult
-from codetest_mcp.parsing.registry import (
+from src.parsing.base import ParsedEdge, ParsedNode, ParseResult
+from src.parsing.registry import (
     EXTENSION_LANGUAGE,
     detect_language,
     is_supported,

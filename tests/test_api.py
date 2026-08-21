@@ -13,13 +13,13 @@ from fastmcp.exceptions import ToolError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from codetest_mcp import db as db_module
-from codetest_mcp import main
-from codetest_mcp.config import settings
-from codetest_mcp.db import Base
-from codetest_mcp.executor import ExecutionResult
-from codetest_mcp.main import mcp
-from codetest_mcp.springboot import PreparedTest
+from src import db as db_module
+from src import main
+from src.config import settings
+from src.db import Base
+from src.executor import ExecutionResult
+from src.main import mcp
+from src.springboot import PreparedTest
 
 ORDER_SERVICE = """\
 package com.example.demo.service;
@@ -225,7 +225,7 @@ async def test_execute_rejects_unparseable_test_code(client, monkeypatch):
 
 
 async def test_execute_surfaces_missing_gradle(client, monkeypatch):
-    from codetest_mcp.executor import ExecutionError
+    from src.executor import ExecutionError
 
     project_id = await _register(client)
     monkeypatch.setattr(

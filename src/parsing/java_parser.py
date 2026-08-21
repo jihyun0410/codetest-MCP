@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import re
 
-from codetest_mcp.db import EdgeType, NodeType
-from codetest_mcp.parsing.base import ParsedEdge, ParsedNode, ParseResult
-from codetest_mcp.parsing.tree_sitter_loader import (
+from src.db import EdgeType, NodeType
+from src.parsing.base import ParsedEdge, ParsedNode, ParseResult
+from src.parsing.tree_sitter_loader import (
     child_by_field,
     field_text,
     get_parser,

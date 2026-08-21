@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from codetest_mcp import springboot
+from src import springboot
 
 PLAIN_TEST = """\
 package com.example.demo;

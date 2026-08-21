@@ -30,14 +30,14 @@ dev = [
 ]
 
 [project.scripts]
-codetest-mcp = "codetest_mcp.__main__:main"
+codetest-mcp = "src.__main__:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["codetest_mcp*"]
+include = ["src*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

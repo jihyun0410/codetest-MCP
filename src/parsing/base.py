@@ -11,7 +11,7 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from codetest_mcp.db import EdgeType, NodeType
+from src.db import EdgeType, NodeType
 
 
 def fingerprint(text: str) -> str:

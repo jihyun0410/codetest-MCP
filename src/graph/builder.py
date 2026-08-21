@@ -15,12 +15,12 @@ from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session
 
-from codetest_mcp.config import get_logger
-from codetest_mcp.db import Project
-from codetest_mcp.graph.store import GraphStore
-from codetest_mcp.parsing.base import ParseResult
-from codetest_mcp.parsing.registry import detect_language, parse_source
-from codetest_mcp.repo import RepoService
+from src.config import get_logger
+from src.db import Project
+from src.graph.store import GraphStore
+from src.parsing.base import ParseResult
+from src.parsing.registry import detect_language, parse_source
+from src.repo import RepoService
 
 logger = get_logger(__name__)
 
@@ -181,7 +181,7 @@ class GraphBuilder:
 
     def _locate_build_files(self, filename: str, max_matches: int = 5) -> list:
         """루트 / 1단계 / 2단계 하위에서만 빌드 파일을 찾는다."""
-        from codetest_mcp.parsing.registry import EXCLUDED_DIRS
+        from src.parsing.registry import EXCLUDED_DIRS
 
         matches = []
         for pattern in (filename, f"*/{filename}", f"*/*/{filename}"):

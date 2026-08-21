@@ -9,13 +9,13 @@ from __future__ import annotations
 
 from pathlib import PurePosixPath
 
-from codetest_mcp.config import get_logger
-from codetest_mcp.parsing.base import ParseResult
-from codetest_mcp.parsing.java_parser import JavaParser
-from codetest_mcp.parsing.js_ts_parser import EXT_LANGUAGE, JsTsParser
-from codetest_mcp.parsing.mybatis_parser import MyBatisXmlParser
-from codetest_mcp.parsing.python_parser import PythonParser
-from codetest_mcp.parsing.sql_parser import SqlParser
+from src.config import get_logger
+from src.parsing.base import ParseResult
+from src.parsing.java_parser import JavaParser
+from src.parsing.js_ts_parser import EXT_LANGUAGE, JsTsParser
+from src.parsing.mybatis_parser import MyBatisXmlParser
+from src.parsing.python_parser import PythonParser
+from src.parsing.sql_parser import SqlParser
 
 logger = get_logger(__name__)
 

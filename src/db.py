@@ -36,7 +36,7 @@ from sqlalchemy.orm import (
     sessionmaker,
 )
 
-from codetest_mcp.config import settings
+from src.config import settings
 
 
 def utcnow() -> datetime:

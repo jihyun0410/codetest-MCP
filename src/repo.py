@@ -12,9 +12,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlparse, urlunparse
 
-from codetest_mcp.config import settings
-from codetest_mcp.config import get_logger
-from codetest_mcp.parsing.registry import EXCLUDED_DIRS, is_supported
+from src.config import settings
+from src.config import get_logger
+from src.parsing.registry import EXCLUDED_DIRS, is_supported
 
 logger = get_logger(__name__)
 

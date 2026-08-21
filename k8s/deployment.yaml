@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${RELEASE_NAME}
+  labels:
+    app.kubernetes.io/name: ${RELEASE_NAME}
+    app.kubernetes.io/managed-by: "jenkins"
+    watcher.project: "9b463ccb-8e7a-463f-a31d-91d3028666a4"
+    watcher.nodeId: "999c9f67-4571-4736-aed4-fe61ded3f835"
+    watcher.role: "mcp"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ${RELEASE_NAME}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ${RELEASE_NAME}
+        app.kubernetes.io/managed-by: "jenkins"
+        watcher.project: "9b463ccb-8e7a-463f-a31d-91d3028666a4"
+        watcher.nodeId: "999c9f67-4571-4736-aed4-fe61ded3f835"
+        watcher.role: "mcp"
+        watcher.branch: ${BRANCH_NAME}
+      annotations:
+        watcher.enabled: "true"
+    spec:
+      imagePullSecrets:
+        - name: cr-pull
+
+      tolerations:
+
+      - key: division
+        operator: Equal
+        value: maxis
+        effect: NoSchedule
+
+      containers:
+        - name: app
+          image: ${FULL_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8100
+          env:
+            - name: TZ
+              value: "Asia/Seoul"
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"

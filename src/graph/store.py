@@ -12,9 +12,9 @@ from collections import defaultdict
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from codetest_mcp.config import get_logger
-from codetest_mcp.db import EdgeType, GraphEdge, GraphNode, NodeType
-from codetest_mcp.parsing.base import ParsedEdge, ParsedNode
+from src.config import get_logger
+from src.db import EdgeType, GraphEdge, GraphNode, NodeType
+from src.parsing.base import ParsedEdge, ParsedNode
 
 logger = get_logger(__name__)
 

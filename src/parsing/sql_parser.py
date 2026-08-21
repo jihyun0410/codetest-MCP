@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import re
 
-from codetest_mcp.db import EdgeType, NodeType
-from codetest_mcp.parsing.base import ParsedEdge, ParsedNode, ParseResult
+from src.db import EdgeType, NodeType
+from src.parsing.base import ParsedEdge, ParsedNode, ParseResult
 
 LANGUAGE = "sql"
 

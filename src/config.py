@@ -25,11 +25,11 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
-    app_name: str = Field(default="Code Test MCP", alias="CODETEST_MCP_APP_NAME")
+    app_name: str = Field(default="Test Code MCP", alias="CODETEST_MCP_APP_NAME")
     host: str = Field(default="0.0.0.0", alias="CODETEST_MCP_HOST")
-    port: int = Field(default=80, alias="CODETEST_MCP_PORT")
-    #: MCP 전송 방식. streamable-http (Agent 가 원격 호출) 또는 stdio (자식 프로세스로 기동)
-    transport: str = Field(default="streamable-http", alias="CODETEST_MCP_TRANSPORT")
+    port: int = Field(default=8100, alias="CODETEST_MCP_PORT")
+    #: MCP 전송 방식. http (Agent 가 원격 호출) 또는 stdio (자식 프로세스로 기동)
+    transport: str = Field(default="http", alias="CODETEST_MCP_TRANSPORT")
 
     #: Agent 인증용 키 목록. http 전송일 때 X-API-Key 헤더와 대조한다.
     #: 비어 있으면 인증 비활성화(로컬 개발 편의).

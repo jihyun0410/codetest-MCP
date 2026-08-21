@@ -11,7 +11,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any
 
-from codetest_mcp.config import get_logger
+from src.config import get_logger
 
 logger = get_logger(__name__)
 

@@ -6,7 +6,7 @@
 
 이 서버는 LLM 을 호출하지 않는다. Agent 가 MCP 클라이언트로 붙어 도구를 호출한다.
 
-    python -m codetest_mcp     # 패키지라 -m 으로 띄운다 (main.py 직접 실행은 import 실패)
+    python -m src     # 패키지라 -m 으로 띄운다 (main.py 직접 실행은 import 실패)
     → streamable-http, 0.0.0.0:80 (CODETEST_MCP_TRANSPORT / _HOST / _PORT 로 변경)
 
 도구 (hello 외 전부 정의서 근거)
@@ -34,9 +34,9 @@ from pydantic import Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from codetest_mcp import springboot
-from codetest_mcp.config import get_logger, settings, setup_logging, verify_api_key
-from codetest_mcp.db import (
+from src import springboot
+from src.config import get_logger, settings, setup_logging, verify_api_key
+from src.db import (
     GraphNode,
     IngestStatus,
     NodeType,
@@ -44,12 +44,12 @@ from codetest_mcp.db import (
     init_db,
     session_scope,
 )
-from codetest_mcp.executor import ExecutionError, run_tests
-from codetest_mcp.graph.builder import GraphBuilder
-from codetest_mcp.graph.impact import ImpactAnalyzer, parse_diff_ranges
-from codetest_mcp.graph.store import GraphStore
-from codetest_mcp.repo import RepoService
-from codetest_mcp.schemas import (
+from src.executor import ExecutionError, run_tests
+from src.graph.builder import GraphBuilder
+from src.graph.impact import ImpactAnalyzer, parse_diff_ranges
+from src.graph.store import GraphStore
+from src.repo import RepoService
+from src.schemas import (
     ChangeAnalysisResponse,
     ChangedUnit,
     ExecuteResponse,
@@ -373,7 +373,7 @@ def execute_tests(
 
 # --- 실행 --------------------------------------------------------------------
 def main() -> None:
-    """`python -m codetest_mcp` / `python codetest_mcp/main.py` 공통 진입점."""
+    """`python -m src` / `python src/main.py` 공통 진입점."""
     if settings.transport == "stdio":
         mcp.run(transport="stdio")
     else:
