@@ -37,6 +37,13 @@ class Settings(BaseSettings):
         default_factory=list, alias="CODETEST_MCP_API_KEYS"
     )
 
+    #: Agent 연동 주소. 개요 수집이 끝나면 이 URL 로 결과를 POST 한다.
+    #: 비우면 통보를 보내지 않는다(로컬 개발/테스트).
+    agent_base_url: str = Field(
+        default="http://maxis-proxy.mks01.test.com:80/agent/1121365",
+        alias="CODETEST_MCP_AGENT_BASE_URL",
+    )
+
     database_url: str = Field(
         default="sqlite:///./data/codetest_mcp.db", alias="CODETEST_MCP_DATABASE_URL"
     )

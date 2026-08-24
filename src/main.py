@@ -7,7 +7,7 @@
 이 서버는 LLM 을 호출하지 않는다. Agent 가 MCP 클라이언트로 붙어 도구를 호출한다.
 
     python -m src     # 패키지라 -m 으로 띄운다 (main.py 직접 실행은 import 실패)
-    → streamable-http, 0.0.0.0:80 (CODETEST_MCP_TRANSPORT / _HOST / _PORT 로 변경)
+    → http(streamable), 0.0.0.0:8100 (CODETEST_MCP_TRANSPORT / _HOST / _PORT 로 변경)
 
 도구 (hello 외 전부 정의서 근거)
   hello                 연결 확인용 에코
@@ -16,11 +16,15 @@
   get_project_overview  저장된 프로젝트 개요 조회                        (상세 1)
   analyze_changes       Git Diff + AST 로 변경 코드 단위·영향도 식별      (2)
   execute_tests         @SpringBootTest 주입 + JaCoCo 실행               (1), (상세 4)
+
+개요 수집이 끝나면 CODETEST_MCP_AGENT_BASE_URL 로 결과를 POST 한다.
 """
 
 from __future__ import annotations
 
+import json
 import threading
+import urllib.request
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -90,9 +94,42 @@ def _base_package(db: Session, project_id: str) -> str | None:
     return springboot.detect_base_package(paths)
 
 
+# --- Agent 통보 --------------------------------------------------------------
+def notify_agent(payload: dict) -> None:
+    """settings.agent_base_url 로 결과를 POST 한다 (fire-and-forget).
+
+    Agent 가 죽어 있거나 느려도 수집 결과는 이미 DB 에 있으므로, 어떤 실패든
+    삼키고 로그만 남긴다. Agent 는 get_project_overview 로도 같은 상태를 읽는다.
+    """
+    if not settings.agent_base_url:
+        return
+
+    request = urllib.request.Request(
+        settings.agent_base_url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        # ponytail: 타임아웃 10초 고정. 프록시가 느리면 설정으로 빼면 된다
+        with urllib.request.urlopen(request, timeout=10) as response:
+            logger.info("Agent 통보 완료 (HTTP %s): %s", response.status, payload["status"])
+    except Exception as exc:
+        logger.warning(
+            "Agent 통보 실패 — 수집 결과는 DB 에 남아 있다 (%s): %s",
+            settings.agent_base_url, exc,
+        )
+
+
 # --- 백그라운드 수집 ---------------------------------------------------------
 def run_ingest(project_id: str) -> None:
-    """등록 직후: clone → AST 파싱 → Graph 적재 → 개요 DB 저장 (정의서 상세 1)."""
+    """등록 직후: clone → AST 파싱 → Graph 적재 → 개요 DB 저장 (정의서 상세 1).
+
+    끝나면 결과를 Agent 로 통보한다. 백그라운드라 Agent 가 완료 시점을 알 방법이
+    폴링밖에 없기 때문이다.
+    """
+    payload: dict | None = None
+
     with session_scope() as db:
         project = db.get(Project, project_id)
         if project is None:
@@ -114,12 +151,32 @@ def run_ingest(project_id: str) -> None:
                 "[%s] 개요 수집 완료 — 노드 %d, 간선 %d (%.2fs)",
                 project.name, stats.node_count, stats.edge_count, stats.elapsed_seconds,
             )
+            payload = {
+                "event": "ingest_completed",
+                "project_id": project.id,
+                "name": project.name,
+                "status": IngestStatus.READY.value,
+                "frameworks": stats.frameworks,
+                "language_stats": stats.language_stats,
+                "node_count": stats.node_count,
+                "edge_count": stats.edge_count,
+            }
         except Exception as exc:  # 어떤 실패든 상태에 남긴다
             db.rollback()
             project.ingest_status = IngestStatus.FAILED.value
             project.ingest_error = str(exc)
             db.commit()
             logger.exception("개요 수집 실패: %s", project_id)
+            payload = {
+                "event": "ingest_completed",
+                "project_id": project.id,
+                "name": project.name,
+                "status": IngestStatus.FAILED.value,
+                "error": str(exc),
+            }
+
+    # 세션을 닫은 뒤에 통보한다 — 네트워크 대기 동안 DB 커넥션을 잡지 않도록
+    notify_agent(payload)
 
 
 # --- 인증 --------------------------------------------------------------------

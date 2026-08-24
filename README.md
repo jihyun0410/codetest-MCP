@@ -94,6 +94,7 @@ python -m src     # 기본: http(streamable), 0.0.0.0:8100
 |---|---|---|
 | `CODETEST_MCP_TRANSPORT` | `http` | `http`(=streamable-http) 또는 `stdio` |
 | `CODETEST_MCP_PORT` | `8100` | 수신 포트 (Service 80 -> targetPort http) |
+| `CODETEST_MCP_AGENT_BASE_URL` | `http://maxis-proxy.mks01.test.com:80/agent/1121365` | 개요 수집 완료 시 결과를 POST 할 Agent 주소. 비우면 통보 안 함 |
 | `CODETEST_MCP_API_KEYS` | (없음) | Agent 인증 키(CSV). 비우면 인증 비활성화 |
 | `CODETEST_MCP_DATABASE_URL` | `sqlite:///./data/codetest_mcp.db` | 개요/그래프 저장소 |
 | `CODETEST_MCP_WORKSPACE_DIR` | `./workspace` | 대상 저장소 clone 위치 |
@@ -105,6 +106,27 @@ API Key 는 **http 전송일 때만** 검사한다 (`X-API-Key` 헤더). stdio �
 
 대상 프로젝트에 `gradlew` 가 있으면 우선 사용한다. JaCoCo 커버리지는 프로젝트
 `build.gradle` 에 `jacoco` 플러그인이 적용되어 있을 때만 수집된다.
+
+## Agent 로 보내는 통보
+
+평소에는 Agent 가 도구를 호출하고 MCP 가 응답하는 단방향이다. 예외가 하나 있다:
+`register_project` 는 개요 수집을 **백그라운드로** 돌리므로 Agent 가 완료 시점을
+알 방법이 폴링밖에 없다. 그래서 수집이 끝나면 `CODETEST_MCP_AGENT_BASE_URL` 로
+결과를 POST 한다.
+
+```jsonc
+// 성공
+{ "event": "ingest_completed", "project_id": "…", "name": "demo", "status": "READY",
+  "frameworks": ["Spring Boot"], "language_stats": {…}, "node_count": 812, "edge_count": 1934 }
+
+// 실패
+{ "event": "ingest_completed", "project_id": "…", "name": "demo", "status": "FAILED",
+  "error": "…" }
+```
+
+통보 실패는 무시한다(로그만 남김). 수집 결과는 이미 DB 에 있고 Agent 는
+`get_project_overview` 로 같은 상태를 읽을 수 있으므로, Agent 가 죽어 있다고 해서
+수집을 실패로 만들 이유가 없다. 타임아웃은 10초 고정이다.
 
 ## 테스트
 

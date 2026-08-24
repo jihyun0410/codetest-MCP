@@ -5,6 +5,7 @@ MCP 는 LLM 을 쓰지 않으므로 스텁이 필요 없다. Git clone / Gradle 
 
 from __future__ import annotations
 
+import json
 import pathlib
 
 import pytest
@@ -249,3 +250,53 @@ async def test_api_key_is_enforced_over_http(monkeypatch):
     assert get_http_headers() == {}          # stdio/in-memory: 신뢰 경계 아님
     assert main.verify_api_key("s3cret") is True
     assert main.verify_api_key("wrong") is False
+
+
+# --- Agent 통보 ---------------------------------------------------------------
+class _FakeResponse:
+    status = 200
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def test_notify_agent_posts_json_to_configured_url(monkeypatch):
+    monkeypatch.setattr(settings, "agent_base_url", "http://agent.test/agent/1")
+    sent = {}
+
+    def _fake_urlopen(request, timeout=None):
+        sent["url"] = request.full_url
+        sent["method"] = request.get_method()
+        sent["ctype"] = request.headers.get("Content-type")
+        sent["body"] = json.loads(request.data.decode("utf-8"))
+        sent["timeout"] = timeout
+        return _FakeResponse()
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", _fake_urlopen)
+    main.notify_agent({"event": "ingest_completed", "status": "READY", "project_id": "p1"})
+
+    assert sent["url"] == "http://agent.test/agent/1"
+    assert sent["method"] == "POST"
+    assert sent["ctype"] == "application/json"
+    assert sent["body"]["project_id"] == "p1"
+    assert sent["timeout"] == 10          # 통보가 스레드를 물고 있지 않도록
+
+
+def test_notify_agent_swallows_failures(monkeypatch):
+    """Agent 가 죽어 있어도 수집은 성공으로 남아야 한다."""
+    monkeypatch.setattr(settings, "agent_base_url", "http://agent.test/agent/1")
+
+    def _boom(request, timeout=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", _boom)
+    main.notify_agent({"status": "READY"})      # 예외가 새어나오면 실패
+
+
+def test_notify_agent_skipped_when_url_is_empty(monkeypatch):
+    monkeypatch.setattr(settings, "agent_base_url", "")
+
+    def _never(request, timeout=None):
+        raise AssertionError("URL 이 비었는데 요청을 보냈다")
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", _never)
+    main.notify_agent({"status": "READY"})
