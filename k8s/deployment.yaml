@@ -38,13 +38,19 @@ spec:
       containers:
         - name: app
           image: ${FULL_IMAGE}
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8100
           env:
             - name: TZ
               value: "Asia/Seoul"
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 30
           readinessProbe:
             tcpSocket:
               port: http
