@@ -90,8 +90,8 @@ async def _register(client, name="demo") -> str:
 async def test_exposes_the_code_based_tools(client):
     names = {t.name for t in await client.list_tools()}
     assert names == {
-        "hello", "register_project", "delete_project", "get_project_overview",
-        "analyze_changes", "execute_tests",
+        "hello", "register_project", "delete_project",
+        "test_generate", "test_run", "execute_tests",
     }
 
 
@@ -126,13 +126,47 @@ async def test_bad_git_url_is_rejected(client):
                     name="x", git_url="ftp://nope", owner="kim")
 
 
-async def test_overview_reports_stored_summary(client):
+async def test_generate_returns_agent_code_with_context(client, monkeypatch):
+    """생성은 Agent 가 하고, MCP 는 정리한 컨텍스트를 넘긴 뒤 결과를 돌려준다."""
     project_id = await _register(client)
-    body = await _call(client, "get_project_overview", project_id=project_id)
+    sent = {}
 
-    assert body["project_id"] == project_id
-    assert body["ingest_status"] == "PENDING"
-    assert body["node_counts"] == {}
+    def _fake_post(payload, timeout):
+        sent.update(payload)
+        sent["timeout"] = timeout
+        return {"test_code": "class GeneratedTest {}"}
+
+    monkeypatch.setattr(main, "_post_agent", _fake_post)
+    monkeypatch.setattr(settings, "agent_base_url", "http://agent.test/agent/1")
+
+    body = await _call(client, "test_generate", project_id=project_id, diff=DIFF,
+                       sources=[{"path": "a/OrderService.java", "content": ORDER_SERVICE}])
+
+    # Agent 로 넘어간 것: 코드 생성에 필요한 사실
+    assert sent["event"] == "test_generate_requested"
+    ctx = sent["context"]
+    path = "src/main/java/com/example/demo/service/OrderService.java"
+    assert path in ctx["changed_ranges"]
+    assert ctx["sources"][0]["content"] == ORDER_SERVICE
+    assert sent["timeout"] == settings.agent_timeout_seconds
+    # 돌려받은 것: Agent 가 생성한 코드 + 근거
+    assert body["test_code"] == "class GeneratedTest {}"
+    assert body["context"]["graph_ready"] is False
+
+
+async def test_generate_requires_agent_url(client, monkeypatch):
+    project_id = await _register(client)
+    monkeypatch.setattr(settings, "agent_base_url", "")
+    with pytest.raises(ToolError, match="Agent 주소"):
+        await _call(client, "test_generate", project_id=project_id)
+
+
+async def test_generate_rejects_agent_response_without_code(client, monkeypatch):
+    project_id = await _register(client)
+    monkeypatch.setattr(settings, "agent_base_url", "http://agent.test/agent/1")
+    monkeypatch.setattr(main, "_post_agent", lambda payload, timeout: {"oops": 1})
+    with pytest.raises(ToolError, match="test_code"):
+        await _call(client, "test_generate", project_id=project_id)
 
 
 async def test_delete_project(client, monkeypatch):
@@ -144,28 +178,41 @@ async def test_delete_project(client, monkeypatch):
         await _call(client, "delete_project", project_id=project_id)
 
 
-# --- 변경 단위 식별 (정의서 (2)) ----------------------------------------------
-async def test_analyze_changes_parses_diff_ranges(client):
+# --- 생성 + 실행 전 과정 ---------------------------------------------------
+async def test_run_generates_then_executes(client, monkeypatch):
     project_id = await _register(client)
-    body = await _call(client, "analyze_changes", project_id=project_id, diff=DIFF)
+    ran = {}
 
-    path = "src/main/java/com/example/demo/service/OrderService.java"
-    assert path in body["changed_ranges"]
-    assert body["risk"] in {"LOW", "MEDIUM", "HIGH"}
-    assert body["risk_reasons"]
+    monkeypatch.setattr(settings, "agent_base_url", "http://agent.test/agent/1")
+    monkeypatch.setattr(main, "_post_agent",
+                        lambda payload, timeout: {"test_code": "class T {}"})
+    monkeypatch.setattr(
+        main.RepoService, "ensure_clone", lambda self, branch=None: pathlib.Path("/tmp/x")
+    )
+
+    def _fake_run(repo_path, prepared: PreparedTest, overlay_sources=None):
+        ran["source"] = prepared.source
+        return ExecutionResult(exit_code=0, output="BUILD SUCCESSFUL",
+                               passed=2, failed=0, skipped=0, total=2,
+                               jacoco_enabled=True, springboot_applied=True,
+                               test_file_path=prepared.file_path,
+                               applied=prepared.applied, command=["gradle"])
+
+    monkeypatch.setattr(main, "run_tests", _fake_run)
+
+    body = await _call(client, "test_run", project_id=project_id, diff=DIFF)
+
+    # 생성 -> 주입 -> 실행이 한 호출로 이어진다
+    assert body["test_code"] == "class T {}"
+    assert "@SpringBootTest" in ran["source"]
+    assert body["execution"]["passed"] == 2
+    # 생성 근거도 함께 돌아온다
+    assert body["context"]["project_id"] == project_id
 
 
-async def test_analyze_warns_when_overview_not_ready(client):
-    project_id = await _register(client)     # ingest 는 스텁이라 PENDING 상태
-    body = await _call(client, "analyze_changes", project_id=project_id, diff=DIFF)
-
-    assert body["graph_ready"] is False
-    assert any("개요 수집" in w for w in body["warnings"])
-
-
-async def test_analyze_unknown_project_is_rejected(client):
+async def test_run_unknown_project_is_rejected(client):
     with pytest.raises(ToolError, match="찾을 수 없습니다"):
-        await _call(client, "analyze_changes", project_id="nope", diff="")
+        await _call(client, "test_run", project_id="nope")
 
 
 # --- 테스트 실행 (정의서 (1), [상세] 4) ----------------------------------------

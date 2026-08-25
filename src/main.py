@@ -10,12 +10,15 @@
     → http(streamable), 0.0.0.0:8100 (CODETEST_MCP_TRANSPORT / _HOST / _PORT 로 변경)
 
 도구 (hello 외 전부 정의서 근거)
-  hello                 연결 확인용 에코
-  register_project      프로젝트 등록 + Git clone + AST → 개요 DB 저장   (상세 1)
-  delete_project        등록 정보/그래프/작업 사본 삭제
-  get_project_overview  저장된 프로젝트 개요 조회                        (상세 1)
-  analyze_changes       Git Diff + AST 로 변경 코드 단위·영향도 식별      (2)
-  execute_tests         @SpringBootTest 주입 + JaCoCo 실행               (1), (상세 4)
+  hello             연결 확인용 에코
+  register_project  프로젝트 등록 + Git clone + AST → 개요 DB 저장   (상세 1)
+  delete_project    등록 정보/그래프/작업 사본 삭제
+  test_generate     컨텍스트 정리 → Agent 가 테스트 코드 생성        (1)
+  test_run          생성 + @SpringBootTest 주입 + JaCoCo 실행 전 과정 (1),(2),(상세 4)
+  execute_tests     이미 있는 테스트 코드를 실행만                   (상세 4)
+
+코드 생성과 변경 의도/영향도 해석은 Agent(LLM) 가 한다. MCP 는 그 판단에
+필요한 사실을 정리해 넘기고, 돌려받은 코드를 실행한다.
 
 개요 수집이 끝나면 CODETEST_MCP_AGENT_BASE_URL 로 결과를 POST 한다.
 """
@@ -54,13 +57,14 @@ from src.graph.impact import ImpactAnalyzer, parse_diff_ranges
 from src.graph.store import GraphStore
 from src.repo import RepoService
 from src.schemas import (
-    ChangeAnalysisResponse,
     ChangedUnit,
     ExecuteResponse,
+    GenerationContext,
     ImpactedUnit,
-    OverviewResponse,
     ProjectRead,
     SourceFilePayload,
+    TestGenerateResponse,
+    TestRunResponse,
 )
 
 setup_logging()
@@ -94,31 +98,77 @@ def _base_package(db: Session, project_id: str) -> str | None:
     return springboot.detect_base_package(paths)
 
 
-# --- Agent 통보 --------------------------------------------------------------
-def notify_agent(payload: dict) -> None:
-    """settings.agent_base_url 로 결과를 POST 한다 (fire-and-forget).
-
-    Agent 가 죽어 있거나 느려도 수집 결과는 이미 DB 에 있으므로, 어떤 실패든
-    삼키고 로그만 남긴다. Agent 는 get_project_overview 로도 같은 상태를 읽는다.
-    """
-    if not settings.agent_base_url:
-        return
-
+# --- Agent 연동 --------------------------------------------------------------
+#
+#  Agent 와 주고받는 계약은 전부 여기 두 함수에 있다. Agent 쪽 API 규격이
+#  다르면 이 블록만 고치면 된다.
+#
+#    통보  MCP -> Agent   {"event": "ingest_completed", ...}          응답 무시
+#    생성  MCP -> Agent   {"event": "test_generate_requested", ...}   {"test_code": "..."}
+#
+def _post_agent(payload: dict, timeout: int) -> dict:
+    """Agent 로 JSON 을 POST 하고 응답 본문을 dict 로 돌려준다."""
     request = urllib.request.Request(
         settings.agent_base_url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = response.read().decode("utf-8")
+    return json.loads(body) if body.strip() else {}
+
+
+def notify_agent(payload: dict) -> None:
+    """수집 결과를 Agent 로 통보한다 (fire-and-forget).
+
+    Agent 가 죽어 있거나 느려도 결과는 이미 DB 에 있으므로 어떤 실패든 삼키고
+    로그만 남긴다. 상태는 test_generate/test_run 응답의 context 로도 드러난다.
+    """
+    if not settings.agent_base_url:
+        return
     try:
-        # ponytail: 타임아웃 10초 고정. 프록시가 느리면 설정으로 빼면 된다
-        with urllib.request.urlopen(request, timeout=10) as response:
-            logger.info("Agent 통보 완료 (HTTP %s): %s", response.status, payload["status"])
+        _post_agent(payload, timeout=10)
+        logger.info("Agent 통보 완료: %s", payload.get("status"))
     except Exception as exc:
         logger.warning(
             "Agent 통보 실패 — 수집 결과는 DB 에 남아 있다 (%s): %s",
             settings.agent_base_url, exc,
         )
+
+
+def request_test_code(context: GenerationContext) -> str:
+    """정리한 컨텍스트를 Agent 로 넘겨 테스트 코드를 생성받는다.
+
+    코드 생성은 LLM 의 일이라 MCP 가 하지 않는다. 여기서는 Agent 가 판단에
+    필요한 사실을 넘기고 결과를 받아올 뿐이다. 통보와 달리 이 응답이 없으면
+    할 일이 없으므로 실패를 삼키지 않고 그대로 올린다.
+    """
+    if not settings.agent_base_url:
+        raise ToolError(
+            "Agent 주소가 설정되지 않아 테스트 코드를 생성할 수 없습니다. "
+            "CODETEST_MCP_AGENT_BASE_URL 을 확인하세요."
+        )
+
+    payload = {
+        "event": "test_generate_requested",
+        "project_id": context.project_id,
+        "context": context.model_dump(mode="json"),
+    }
+    try:
+        answer = _post_agent(payload, timeout=settings.agent_timeout_seconds)
+    except Exception as exc:
+        raise ToolError(
+            f"Agent 로 코드 생성을 요청하지 못했습니다 ({settings.agent_base_url}): {exc}"
+        ) from None
+
+    test_code = (answer.get("test_code") or "").strip()
+    if not test_code:
+        raise ToolError(
+            "Agent 응답에 test_code 가 없습니다. 응답 형식은 "
+            '{"test_code": "<Java 소스>"} 여야 합니다.'
+        )
+    return test_code
 
 
 # --- 백그라운드 수집 ---------------------------------------------------------
@@ -238,7 +288,8 @@ def register_project(
     """프로젝트를 등록하고 Git clone + AST 개요 수집을 백그라운드로 시작한다.
 
     즉시 ingest_status=PENDING 으로 반환한다. 수집 완료 여부는
-    get_project_overview 로 확인한다 (PENDING → RUNNING → READY/FAILED).
+    test_generate/test_run 응답의 context.ingest_status 로 확인한다
+    (PENDING → RUNNING → READY/FAILED). 완료 시 Agent 로 통보도 간다.
     """
     if not git_url.startswith(("http://", "https://", "git@")):
         raise ToolError("git_url 은 http(s):// 또는 git@ 형식이어야 합니다.")
@@ -276,117 +327,107 @@ def delete_project(project_id: str) -> dict:
     return {"deleted": project_id}
 
 
-@mcp.tool()
-def get_project_overview(project_id: str) -> OverviewResponse:
-    """DB 에 저장된 프로젝트 개요를 돌려준다 (Agent 프롬프트 컨텍스트).
+# --- 컨텍스트 정리 (MCP 의 몫) ------------------------------------------------
+def _build_context(
+    db: Session, project: Project, diff: str, sources: list[SourceFilePayload]
+) -> GenerationContext:
+    """Agent 가 코드 생성·영향도 분석을 하는 데 필요한 사실을 한데 모은다.
 
-    프레임워크, 언어 비중, 그래프 노드/간선 수, @SpringBootApplication 기준 패키지.
+    개요(프레임워크/기준 패키지/그래프 규모) + Diff 로 확정한 변경 지점 + 변경
+    파일 본문. 여기까지가 코드로 확정 가능한 범위이고, 이후 해석은 Agent 몫이다.
     """
-    with session_scope() as db:
-        project = _project(db, project_id)
-        store = GraphStore(db, project.id)
-        return OverviewResponse(
-            project_id=project.id,
-            name=project.name,
-            ingest_status=project.ingest_status,
-            ingest_error=project.ingest_error,
-            frameworks=project.frameworks or [],
-            language_stats=project.language_stats or {},
-            node_counts=store.counts_by_type(),
-            edge_counts=store.edge_counts_by_type(),
-            base_package=_base_package(db, project.id),
-            last_indexed_at=project.last_indexed_at,
+    store = GraphStore(db, project.id)
+    ranges = parse_diff_ranges(diff)
+    report = ImpactAnalyzer(store).analyze(ranges)
+
+    graph_ready = project.ingest_status == IngestStatus.READY.value
+    warnings: list[str] = []
+    if not graph_ready:
+        warnings.append(
+            f"프로젝트 개요 수집이 완료되지 않았습니다 (상태: {project.ingest_status}). "
+            "AST 기반 변경 단위 식별 결과가 비어 있을 수 있습니다."
         )
+    if ranges and not report.changed:
+        warnings.append("Diff 라인과 겹치는 그래프 노드를 찾지 못했습니다.")
+
+    return GenerationContext(
+        project_id=project.id,
+        name=project.name,
+        ingest_status=project.ingest_status,
+        graph_ready=graph_ready,
+        frameworks=project.frameworks or [],
+        language_stats=project.language_stats or {},
+        base_package=_base_package(db, project.id),
+        node_counts=store.counts_by_type(),
+        edge_counts=store.edge_counts_by_type(),
+        changed_ranges=ranges,
+        changed_units=[
+            ChangedUnit(
+                qualified_name=info.qualified_name,
+                name=info.name,
+                node_type=info.node_type,
+                file_path=info.file_path,
+                language=(info.meta or {}).get("language"),
+                signature=info.signature,
+                start_line=info.start_line,
+                end_line=info.end_line,
+                entrypoint=bool((info.meta or {}).get("entrypoint")),
+                http_method=(info.meta or {}).get("http_method"),
+                route=(info.meta or {}).get("route"),
+            )
+            for info in report.changed
+        ],
+        impacted_units=[
+            ImpactedUnit(
+                qualified_name=info.qualified_name,
+                node_type=info.node_type,
+                file_path=info.file_path,
+                depth=info.depth,
+                via=info.via,
+            )
+            for info in report.impacted
+        ],
+        affected_files=report.affected_files,
+        sources=sources,
+        warnings=warnings,
+    )
 
 
-# --- 변경 코드 식별 (정의서 (2)) ----------------------------------------------
+# --- 테스트 코드 생성 (정의서 (1)) ---------------------------------------------
 @mcp.tool()
-def analyze_changes(
+def test_generate(
     project_id: str,
     diff: Annotated[str, Field(description="변경분 unified diff")] = "",
-) -> ChangeAnalysisResponse:
-    """Git Diff 와 AST 분석 기반으로 실제 변경된 코드 단위·영향도를 식별한다.
+    sources: Annotated[
+        list[SourceFilePayload],
+        Field(description="테스트 대상 파일 본문 (미커밋 변경분 포함)"),
+    ] = [],  # noqa: B006 — 읽기 전용. pydantic 이 호출마다 복사한다
+) -> TestGenerateResponse:
+    """테스트를 위한 코드를 생성해 반환한다.
 
-    확정 가능한 사실만 반환한다. 의도(기능 추가/조건 변경/성능 개선) 해석은
-    LLM 의 일이므로 이 결과를 받아 호출하는 쪽에서 수행한다.
+    생성 자체는 LLM 의 일이라 Agent 가 수행한다. MCP 는 생성에 필요한 정보를
+    정리해 Agent 로 넘기고(프로젝트 개요·기준 패키지·Diff 로 확정한 변경 단위·
+    변경 파일 본문), 돌려받은 코드를 반환한다. 실행은 하지 않는다.
     """
     with session_scope() as db:
         project = _project(db, project_id)
+        context = _build_context(db, project, diff, sources)
 
-        analyzer = ImpactAnalyzer(GraphStore(db, project.id))
-        ranges = parse_diff_ranges(diff)
-        report = analyzer.analyze(ranges)
-
-        graph_ready = project.ingest_status == IngestStatus.READY.value
-        warnings: list[str] = []
-        if not graph_ready:
-            warnings.append(
-                f"프로젝트 개요 수집이 완료되지 않았습니다 (상태: {project.ingest_status}). "
-                "AST 기반 변경 단위 식별 결과가 비어 있을 수 있습니다."
-            )
-        if ranges and not report.changed:
-            warnings.append("Diff 라인과 겹치는 그래프 노드를 찾지 못했습니다.")
-
-        return ChangeAnalysisResponse(
-            project_id=project.id,
-            changed_ranges=ranges,
-            changed_units=[
-                ChangedUnit(
-                    qualified_name=info.qualified_name,
-                    name=info.name,
-                    node_type=info.node_type,
-                    file_path=info.file_path,
-                    language=(info.meta or {}).get("language"),
-                    signature=info.signature,
-                    start_line=info.start_line,
-                    end_line=info.end_line,
-                    entrypoint=bool((info.meta or {}).get("entrypoint")),
-                    http_method=(info.meta or {}).get("http_method"),
-                    route=(info.meta or {}).get("route"),
-                )
-                for info in report.changed
-            ],
-            impacted_units=[
-                ImpactedUnit(
-                    qualified_name=info.qualified_name,
-                    node_type=info.node_type,
-                    file_path=info.file_path,
-                    depth=info.depth,
-                    via=info.via,
-                )
-                for info in report.impacted
-            ],
-            affected_files=report.affected_files,
-            risk=report.risk.value,
-            risk_score=report.score,
-            risk_reasons=report.reasons,
-            frameworks=project.frameworks or [],
-            base_package=_base_package(db, project.id),
-            graph_ready=graph_ready,
-            warnings=warnings,
-        )
+    # 세션을 닫은 뒤 호출한다 — LLM 생성은 오래 걸리므로 DB 커넥션을 물지 않는다
+    test_code = request_test_code(context)
+    return TestGenerateResponse(
+        project_id=context.project_id, test_code=test_code, context=context
+    )
 
 
 # --- 테스트 실행 (정의서 (1), 상세 4) ------------------------------------------
-@mcp.tool()
-def execute_tests(
+def _execute(
     project_id: str,
-    test_code: Annotated[str, Field(description="생성된 Java 테스트 소스")],
-    sources: Annotated[
-        list[SourceFilePayload],
-        Field(description="실행 전에 작업 사본에 덮어쓸 변경 파일 (미커밋 변경분)"),
-    ] = [],  # noqa: B006 — 읽기 전용. pydantic 이 호출마다 복사한다
-    base_package: Annotated[
-        str | None,
-        Field(description="package 선언이 없을 때 쓸 기준 패키지. 생략하면 개요에서 찾는다"),
-    ] = None,
+    test_code: str,
+    sources: list[SourceFilePayload],
+    base_package: str | None,
 ) -> ExecuteResponse:
-    """생성된 Test Code 를 @SpringBootTest 에 넣고 JaCoCo 와 함께 실행한다.
-
-    @SpringBootTest 가 없으면 주입하고 import/package 선언도 보강한 뒤
-    src/test/java/<package>/<Class>.java 로 저장해 gradle test 를 돌린다.
-    실행 사실만 반환한다 — 결과 적절성 판정은 호출하는 쪽의 몫이다.
-    """
+    """@SpringBootTest 주입 + gradle/JaCoCo 실행. execute_tests 와 test_run 이 공유한다."""
     with session_scope() as db:
         project = _project(db, project_id)
         pkg = base_package or _base_package(db, project.id)
@@ -425,6 +466,66 @@ def execute_tests(
         applied=result.applied,
         test_file_path=result.test_file_path,
         command=result.command,
+    )
+
+
+@mcp.tool()
+def execute_tests(
+    project_id: str,
+    test_code: Annotated[str, Field(description="생성된 Java 테스트 소스")],
+    sources: Annotated[
+        list[SourceFilePayload],
+        Field(description="실행 전에 작업 사본에 덮어쓸 변경 파일 (미커밋 변경분)"),
+    ] = [],  # noqa: B006 — 읽기 전용. pydantic 이 호출마다 복사한다
+    base_package: Annotated[
+        str | None,
+        Field(description="package 선언이 없을 때 쓸 기준 패키지. 생략하면 개요에서 찾는다"),
+    ] = None,
+) -> ExecuteResponse:
+    """생성된 Test Code 를 @SpringBootTest 에 넣고 JaCoCo 와 함께 실행한다.
+
+    @SpringBootTest 가 없으면 주입하고 import/package 선언도 보강한 뒤
+    src/test/java/<package>/<Class>.java 로 저장해 gradle test 를 돌린다.
+    실행 사실만 반환한다 — 결과 적절성 판정은 호출하는 쪽의 몫이다.
+    """
+    return _execute(project_id, test_code, sources, base_package)
+
+
+# --- 생성 + 실행 전 과정 (정의서 (1), (2), 상세 4) ------------------------------
+@mcp.tool()
+def test_run(
+    project_id: str,
+    diff: Annotated[str, Field(description="변경분 unified diff")] = "",
+    sources: Annotated[
+        list[SourceFilePayload],
+        Field(description="테스트 대상 파일 본문 (실행 전 작업 사본에 덮어쓴다)"),
+    ] = [],  # noqa: B006 — 읽기 전용. pydantic 이 호출마다 복사한다
+    base_package: Annotated[
+        str | None,
+        Field(description="package 선언이 없을 때 쓸 기준 패키지. 생략하면 개요에서 찾는다"),
+    ] = None,
+) -> TestRunResponse:
+    """테스트 코드 생성부터 실제 실행까지 전 과정을 수행한다.
+
+    코드 생성과 Diff/AST 기반 영향도 해석은 LLM 의 일이라 Agent 가 수행한다.
+    MCP 는 (1) 두 작업에 필요한 정보를 정리해 Agent 로 넘기고, (2) 돌려받은
+    코드에 @SpringBootTest 를 주입해 JaCoCo 와 함께 실행한 뒤, (3) 생성 근거와
+    실행 사실을 함께 반환한다. 결과 적절성 판정은 호출하는 쪽의 몫이다.
+
+    LLM 생성 + gradle 빌드를 연달아 하므로 응답까지 수 분이 걸릴 수 있다.
+    """
+    with session_scope() as db:
+        project = _project(db, project_id)
+        context = _build_context(db, project, diff, sources)
+
+    test_code = request_test_code(context)
+    execution = _execute(project_id, test_code, sources, base_package or context.base_package)
+
+    return TestRunResponse(
+        project_id=context.project_id,
+        test_code=test_code,
+        context=context,
+        execution=execution,
     )
 
 

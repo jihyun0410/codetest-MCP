@@ -43,6 +43,10 @@ class Settings(BaseSettings):
         default="http://maxis-proxy.mks01.test.com:80/agent/1121365",
         alias="CODETEST_MCP_AGENT_BASE_URL",
     )
+    #: Agent 의 코드 생성 응답을 기다리는 시간(초). LLM 호출이라 통보보다 길다.
+    agent_timeout_seconds: int = Field(
+        default=120, alias="CODETEST_MCP_AGENT_TIMEOUT"
+    )
 
     database_url: str = Field(
         default="sqlite:///./data/codetest_mcp.db", alias="CODETEST_MCP_DATABASE_URL"
