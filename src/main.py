@@ -109,15 +109,26 @@ def _base_package(db: Session, project_id: str) -> str | None:
 #
 def _post_agent(payload: dict, timeout: int) -> dict:
     """Agent 로 JSON 을 POST 하고 응답 본문을 dict 로 돌려준다."""
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         settings.agent_base_url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
+    )
+    # 어디로 쏘는지 남긴다. 본문은 sources 때문에 커질 수 있어 크기만 찍는다.
+    logger.info(
+        "Agent 요청 -> %s %s (event=%s, %d bytes, timeout=%ds)",
+        request.get_method(), request.full_url,
+        payload.get("event", "?"), len(data), timeout,
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8")
+            logger.info(
+                "Agent 응답 <- HTTP %s %s (%d bytes)",
+                response.status, request.full_url, len(body),
+            )
     except urllib.error.HTTPError as exc:
         # 서버가 거절한 이유는 응답에 들어 있다. 그냥 삼키면 405/415 같은 에러가
         # 상태 코드만 남아 원인을 알 수 없다. 405 는 규격상 Allow 헤더가 붙는다.
@@ -129,7 +140,12 @@ def _post_agent(payload: dict, timeout: int) -> dict:
             hints.append(f"응답 타입: {exc.headers['Content-Type']}")
         if detail:
             hints.append(f"본문: {detail[:300]}")
+        logger.error("Agent 요청 실패 <- %s : %s", request.full_url, " | ".join(hints))
         raise RuntimeError(" | ".join(hints)) from None
+    except urllib.error.URLError as exc:
+        # 연결 자체가 안 된 경우 (DNS/방화벽/포트). 주소를 함께 남긴다.
+        logger.error("Agent 연결 실패 <- %s : %s", request.full_url, exc.reason)
+        raise RuntimeError(f"연결 실패({exc.reason})") from None
     return json.loads(body) if body.strip() else {}
 
 
@@ -307,6 +323,11 @@ async def lifespan(server: FastMCP) -> AsyncIterator[None]:
     settings.ensure_directories()
     init_db()
     logger.info("%s 기동 (transport=%s)", settings.app_name, settings.transport)
+    logger.info(
+        "Agent 주소: %s (timeout=%ds)",
+        settings.agent_base_url or "(설정 안 됨 — test_generate/test_run 불가)",
+        settings.agent_timeout_seconds,
+    )
     yield
     logger.info("%s 종료", settings.app_name)
 
