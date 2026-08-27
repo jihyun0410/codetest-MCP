@@ -22,6 +22,9 @@ from src.executor import ExecutionResult
 from src.main import mcp
 from src.springboot import PreparedTest
 
+#: client 픽스처가 main.run_ingest 를 스텁으로 덮으므로 진짜 함수를 미리 잡아둔다.
+REAL_RUN_INGEST = main.run_ingest
+
 ORDER_SERVICE = """\
 package com.example.demo.service;
 
@@ -90,7 +93,7 @@ async def _register(client, name="demo") -> str:
 async def test_exposes_the_code_based_tools(client):
     names = {t.name for t in await client.list_tools()}
     assert names == {
-        "hello", "register_project", "delete_project",
+        "hello", "register_project", "project_status", "delete_project",
         "test_generate", "test_run", "execute_tests",
     }
 
@@ -167,6 +170,52 @@ async def test_generate_rejects_agent_response_without_code(client, monkeypatch)
     monkeypatch.setattr(main, "_post_agent", lambda payload, timeout: {"oops": 1})
     with pytest.raises(ToolError, match="test_code"):
         await _call(client, "test_generate", project_id=project_id)
+
+
+# --- 등록 결과 확인 ------------------------------------------------------------
+async def test_project_status_reports_pending_then_ready(client):
+    project_id = await _register(client)          # run_ingest 는 스텁
+    assert (await _call(client, "project_status",
+                        project_id=project_id))["ingest_status"] == "PENDING"
+
+    # 수집이 끝난 상태를 흉내낸다
+    from src.db import IngestStatus, Project
+    with main.session_scope() as db:
+        db.get(Project, project_id).ingest_status = IngestStatus.READY.value
+        db.commit()
+
+    assert (await _call(client, "project_status",
+                        project_id=project_id))["ingest_status"] == "READY"
+
+
+async def test_project_status_unknown_project_is_rejected(client):
+    with pytest.raises(ToolError, match="찾을 수 없습니다"):
+        await _call(client, "project_status", project_id="nope")
+
+
+async def test_run_ingest_records_failure_instead_of_dying(client, monkeypatch):
+    """스레드에서 예외가 새어나가도 PENDING 으로 방치되지 않아야 한다."""
+    from src.db import IngestStatus, Project
+
+    with main.session_scope() as db:
+        project = Project(name="boom", git_url="https://x/y", owner="kim",
+                          ingest_status=IngestStatus.PENDING.value)
+        db.add(project); db.commit(); db.refresh(project)
+        project_id = project.id
+
+    # _collect_overview 진입 자체가 터지는 상황 (예: 세션/드라이버 실패)
+    monkeypatch.setattr(main, "_collect_overview",
+                        lambda pid: (_ for _ in ()).throw(RuntimeError("드라이버 없음")))
+    notified = {}
+    monkeypatch.setattr(main, "notify_agent", lambda p: notified.update(p))
+
+    REAL_RUN_INGEST(project_id)                   # 예외가 새어나오면 실패
+
+    with main.session_scope() as db:
+        project = db.get(Project, project_id)
+        assert project.ingest_status == "FAILED"
+        assert "드라이버 없음" in project.ingest_error
+    assert notified["status"] == "FAILED"
 
 
 async def test_delete_project(client, monkeypatch):

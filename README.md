@@ -28,10 +28,27 @@ Agent 에게 돌려준다. Agent 는 MCP 클라이언트로 붙어 도구를 호
 |---|---|
 | `hello` | 연결 확인용 에코 |
 | `register_project` | 프로젝트 등록 + 개요 수집(백그라운드) |
+| `project_status` | 등록·수집 성공 여부 확인 |
 | `delete_project` | 프로젝트·그래프·작업 사본 삭제 |
 | `test_generate` | 컨텍스트 정리 → Agent 가 테스트 코드 생성 |
 | `test_run` | 생성부터 실행까지 전 과정 |
 | `execute_tests` | 이미 있는 테스트 코드를 실행만 |
+
+### `register_project(...)` / `project_status(project_id)`
+
+`register_project` 는 개요 수집을 **백그라운드로** 돌리고 즉시 `PENDING` 을 반환한다.
+실제 성공 여부는 `project_status` 로 확인한다.
+
+| `ingest_status` | 뜻 |
+|---|---|
+| `PENDING` | 등록됨, 수집 대기 |
+| `RUNNING` | 수집 중 |
+| `READY` | 수집 완료 — `frameworks`, `last_indexed_at` 이 채워진다 |
+| `FAILED` | 수집 실패 — `ingest_error` 에 사유 |
+
+수집 스레드에서 어떤 예외가 나든 `FAILED` 로 기록된다. 예외가 스레드 밖으로
+새어나가면 파이썬은 스택트레이스만 찍고 끝내므로, 그대로 두면 DB 가 `PENDING`
+인 채 남아 호출자가 실패를 영원히 알 수 없다.
 
 ### `test_generate(project_id, diff, sources)`
 
