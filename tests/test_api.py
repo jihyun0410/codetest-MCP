@@ -93,7 +93,7 @@ async def _register(client, name="demo") -> str:
 async def test_exposes_the_code_based_tools(client):
     names = {t.name for t in await client.list_tools()}
     assert names == {
-        "hello", "register_project", "project_status", "delete_project",
+        "hello", "register_project", "delete_project",
         "test_generate", "test_run", "execute_tests",
     }
 
@@ -172,29 +172,9 @@ async def test_generate_rejects_agent_response_without_code(client, monkeypatch)
         await _call(client, "test_generate", project_id=project_id)
 
 
-# --- 등록 결과 확인 ------------------------------------------------------------
-async def test_project_status_reports_pending_then_ready(client):
-    project_id = await _register(client)          # run_ingest 는 스텁
-    assert (await _call(client, "project_status",
-                        project_id=project_id))["ingest_status"] == "PENDING"
-
-    # 수집이 끝난 상태를 흉내낸다
-    from src.db import IngestStatus, Project
-    with main.session_scope() as db:
-        db.get(Project, project_id).ingest_status = IngestStatus.READY.value
-        db.commit()
-
-    assert (await _call(client, "project_status",
-                        project_id=project_id))["ingest_status"] == "READY"
-
-
-async def test_project_status_unknown_project_is_rejected(client):
-    with pytest.raises(ToolError, match="찾을 수 없습니다"):
-        await _call(client, "project_status", project_id="nope")
-
-
-async def test_run_ingest_records_failure_instead_of_dying(client, monkeypatch):
-    """스레드에서 예외가 새어나가도 PENDING 으로 방치되지 않아야 한다."""
+# --- 등록 결과 로그 ------------------------------------------------------------
+async def test_run_ingest_logs_and_records_failure(client, monkeypatch, caplog):
+    """스레드에서 예외가 새어나가도 로그에 남고 PENDING 으로 방치되지 않아야 한다."""
     from src.db import IngestStatus, Project
 
     with main.session_scope() as db:
@@ -209,7 +189,15 @@ async def test_run_ingest_records_failure_instead_of_dying(client, monkeypatch):
     notified = {}
     monkeypatch.setattr(main, "notify_agent", lambda p: notified.update(p))
 
-    REAL_RUN_INGEST(project_id)                   # 예외가 새어나오면 실패
+    with caplog.at_level("INFO", logger="src.main"):
+        REAL_RUN_INGEST(project_id)               # 예외가 새어나오면 실패
+
+    # 배포 환경에서 kubectl logs 로 볼 수 있어야 하는 것들
+    log = caplog.text
+    assert "개요 수집 시작" in log
+    assert "예기치 않게 중단" in log
+    assert "드라이버 없음" in log                  # 스택트레이스까지
+    assert "개요 수집 결과: FAILED" in log
 
     with main.session_scope() as db:
         project = db.get(Project, project_id)

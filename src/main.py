@@ -12,7 +12,6 @@
 도구 (hello 외 전부 정의서 근거)
   hello             연결 확인용 에코
   register_project  프로젝트 등록 + Git clone + AST → 개요 DB 저장   (상세 1)
-  project_status    등록·수집 성공 여부 확인
   delete_project    등록 정보/그래프/작업 사본 삭제
   test_generate     컨텍스트 정리 → Agent 가 테스트 코드 생성        (1)
   test_run          생성 + @SpringBootTest 주입 + JaCoCo 실행 전 과정 (1),(2),(상세 4)
@@ -180,15 +179,21 @@ def run_ingest(project_id: str) -> None:
     그러면 DB 는 PENDING 인 채로 영원히 남아 호출자가 실패를 알 방법이 없다.
     그래서 어떤 실패든 여기서 잡아 상태에 기록하고 Agent 로 통보한다.
     """
+    logger.info("[%s] 개요 수집 시작", project_id)
     try:
         payload = _collect_overview(project_id)
     except Exception as exc:
-        logger.exception("개요 수집이 예기치 않게 중단됐습니다: %s", project_id)
+        # 스레드 밖으로 새어나가면 기본 excepthook 이 stderr 에 찍고 끝나므로
+        # 로거를 거치지 않는다. 여기서 잡아야 배포 환경 로그에 남는다.
+        logger.exception("[%s] 개요 수집이 예기치 않게 중단됐습니다", project_id)
         payload = _mark_ingest_failed(project_id, exc)
 
-    # 세션을 닫은 뒤에 통보한다 — 네트워크 대기 동안 DB 커넥션을 잡지 않도록
     if payload:
+        logger.info("[%s] 개요 수집 결과: %s", project_id, payload["status"])
+        # 세션을 닫은 뒤에 통보한다 — 네트워크 대기 동안 DB 커넥션을 잡지 않도록
         notify_agent(payload)
+    else:
+        logger.error("[%s] 개요 수집 결과를 기록하지 못했습니다", project_id)
 
 
 def _mark_ingest_failed(project_id: str, exc: Exception) -> dict | None:
@@ -201,6 +206,7 @@ def _mark_ingest_failed(project_id: str, exc: Exception) -> dict | None:
             project.ingest_status = IngestStatus.FAILED.value
             project.ingest_error = f"{type(exc).__name__}: {exc}"
             db.commit()
+            logger.error("[%s] 수집 실패로 기록: %s", project.name, project.ingest_error)
             return {
                 "event": "ingest_completed",
                 "project_id": project.id,
@@ -346,24 +352,14 @@ def register_project(
         db.commit()
         db.refresh(project)
 
+        logger.info(
+            "[%s] 프로젝트 등록 완료 — id=%s, git=%s, branch=%s",
+            project.name, project.id, project.git_url, project.default_branch,
+        )
+        # args 는 반드시 튜플이어야 한다. 문자열을 넘기면 글자 단위로 풀려
+        # run_ingest() takes 1 positional argument but 32 were given 이 난다.
         threading.Thread(target=run_ingest, args=(project.id,), daemon=True).start()
         return _to_read(project)
-
-
-@mcp.tool()
-def project_status(project_id: str) -> ProjectRead:
-    """프로젝트 등록·개요 수집의 성공 여부를 확인한다.
-
-    register_project 는 수집을 백그라운드로 돌리고 즉시 PENDING 을 반환하므로,
-    실제 성공 여부는 이 도구로 확인한다.
-
-      PENDING  등록됨, 수집 대기            RUNNING  수집 중
-      READY    수집 완료 (성공)             FAILED   수집 실패 — ingest_error 에 사유
-
-    READY 면 last_indexed_at 과 frameworks 가 채워진다.
-    """
-    with session_scope() as db:
-        return _to_read(_project(db, project_id))
 
 
 @mcp.tool()
