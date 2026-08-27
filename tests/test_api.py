@@ -172,6 +172,32 @@ async def test_generate_rejects_agent_response_without_code(client, monkeypatch)
         await _call(client, "test_generate", project_id=project_id)
 
 
+async def test_generate_surfaces_why_the_agent_refused(client, monkeypatch):
+    """405/415 처럼 서버가 거절한 경우, 이유가 응답에 있으니 메시지로 끌어올린다."""
+    import io
+    import urllib.error
+
+    project_id = await _register(client)
+    monkeypatch.setattr(settings, "agent_base_url", "http://agent.test/agent/1")
+
+    def _refuse(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url, 405, "Method Not Allowed",
+            {"Allow": "GET, PUT", "Content-Type": "application/json"},
+            io.BytesIO(b'{"detail":"use /invoke"}'),
+        )
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", _refuse)
+
+    with pytest.raises(ToolError) as caught:
+        await _call(client, "test_generate", project_id=project_id)
+
+    message = str(caught.value)
+    assert "405" in message
+    assert "GET, PUT" in message          # 어떤 메서드를 써야 하는지
+    assert "use /invoke" in message       # 서버가 알려준 힌트
+
+
 # --- 등록 결과 로그 ------------------------------------------------------------
 async def test_run_ingest_logs_and_records_failure(client, monkeypatch, caplog):
     """스레드에서 예외가 새어나가도 로그에 남고 PENDING 으로 방치되지 않아야 한다."""

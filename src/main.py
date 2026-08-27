@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import threading
+import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -114,8 +115,21 @@ def _post_agent(payload: dict, timeout: int) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        body = response.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        # 서버가 거절한 이유는 응답에 들어 있다. 그냥 삼키면 405/415 같은 에러가
+        # 상태 코드만 남아 원인을 알 수 없다. 405 는 규격상 Allow 헤더가 붙는다.
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+        hints = [f"HTTP {exc.code} {exc.reason}"]
+        if exc.headers.get("Allow"):
+            hints.append(f"허용 메서드: {exc.headers['Allow']}")
+        if exc.headers.get("Content-Type"):
+            hints.append(f"응답 타입: {exc.headers['Content-Type']}")
+        if detail:
+            hints.append(f"본문: {detail[:300]}")
+        raise RuntimeError(" | ".join(hints)) from None
     return json.loads(body) if body.strip() else {}
 
 
