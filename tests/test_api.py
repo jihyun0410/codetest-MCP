@@ -134,8 +134,9 @@ async def test_generate_returns_agent_code_with_context(client, monkeypatch):
     project_id = await _register(client)
     sent = {}
 
-    def _fake_post(payload, timeout):
+    def _fake_post(path, payload, timeout):
         sent.update(payload)
+        sent["path"] = path
         sent["timeout"] = timeout
         return {"test_code": "class GeneratedTest {}",
                 "impact": "OrderService.calculateTotal 조건 분기 추가",
@@ -149,6 +150,7 @@ async def test_generate_returns_agent_code_with_context(client, monkeypatch):
 
     # Agent 로 넘어간 것: 코드 생성에 필요한 사실
     assert sent["event"] == "test_generate_requested"
+    assert sent["path"] == "/api/v1/tests/generate"
     ctx = sent["context"]
     path = "src/main/java/com/example/demo/service/OrderService.java"
     assert path in ctx["changed_ranges"]
@@ -173,7 +175,8 @@ async def test_generate_requires_agent_url(client, monkeypatch):
 async def test_generate_rejects_agent_response_without_code(client, monkeypatch):
     project_id = await _register(client)
     monkeypatch.setattr(settings, "agent_base_url", "http://agent.test/agent/1")
-    monkeypatch.setattr(main, "_post_agent", lambda payload, timeout: {"oops": 1})
+    monkeypatch.setattr(main, "_post_agent",
+                        lambda path, payload, timeout: {"oops": 1})
     with pytest.raises(ToolError, match="test_code"):
         await _call(client, "test_generate", project_id=project_id)
 
@@ -219,7 +222,7 @@ async def test_run_ingest_logs_and_records_failure(client, monkeypatch, caplog):
     monkeypatch.setattr(main, "_collect_overview",
                         lambda pid: (_ for _ in ()).throw(RuntimeError("드라이버 없음")))
     notified = {}
-    monkeypatch.setattr(main, "notify_agent", lambda p: notified.update(p))
+    monkeypatch.setattr(main, "notify_agent", lambda path, p: notified.update(p, path=path))
 
     with caplog.at_level("INFO", logger="src.main"):
         REAL_RUN_INGEST(project_id)               # 예외가 새어나오면 실패
@@ -236,6 +239,7 @@ async def test_run_ingest_logs_and_records_failure(client, monkeypatch, caplog):
         assert project.ingest_status == "FAILED"
         assert "드라이버 없음" in project.ingest_error
     assert notified["status"] == "FAILED"
+    assert notified["path"] == "/api/v1/projects"
 
 
 async def test_delete_project(client, monkeypatch):
@@ -253,9 +257,14 @@ async def test_run_generates_then_executes(client, monkeypatch):
     ran = {}
 
     monkeypatch.setattr(settings, "agent_base_url", "http://agent.test/agent/1")
-    monkeypatch.setattr(main, "_post_agent",
-                        lambda payload, timeout: {"test_code": "class T {}",
-                                                  "impact": "영향 없음"})
+    posted = {}
+
+    def _fake_post(path, payload, timeout):
+        posted["path"] = path
+        posted["event"] = payload["event"]
+        return {"test_code": "class T {}", "impact": "영향 없음"}
+
+    monkeypatch.setattr(main, "_post_agent", _fake_post)
     monkeypatch.setattr(
         main.RepoService, "ensure_clone", lambda self, branch=None: pathlib.Path("/tmp/x")
     )
@@ -279,6 +288,9 @@ async def test_run_generates_then_executes(client, monkeypatch):
     # 생성 근거도 함께 돌아온다
     assert body["context"]["project_id"] == project_id
     assert body["analysis"]["impact"] == "영향 없음"
+    # test_run 은 generate 와 다른 경로/event 로 나간다
+    assert posted["path"] == "/api/v1/tests/run"
+    assert posted["event"] == "test_run_requested"
 
 
 async def test_run_unknown_project_is_rejected(client):
@@ -390,9 +402,11 @@ def test_notify_agent_posts_json_to_configured_url(monkeypatch):
         return _FakeResponse()
 
     monkeypatch.setattr(main.urllib.request, "urlopen", _fake_urlopen)
-    main.notify_agent({"event": "ingest_completed", "status": "READY", "project_id": "p1"})
+    main.notify_agent(main.AGENT_PATH_INGEST,
+                      {"event": "ingest_completed", "status": "READY", "project_id": "p1"})
 
-    assert sent["url"] == "http://agent.test/agent/1"
+    # base_url 뒤에 command 경로가 붙는다
+    assert sent["url"] == "http://agent.test/agent/1/api/v1/projects"
     assert sent["method"] == "POST"
     assert sent["ctype"] == "application/json"
     assert sent["body"]["project_id"] == "p1"
@@ -407,7 +421,7 @@ def test_notify_agent_swallows_failures(monkeypatch):
         raise OSError("connection refused")
 
     monkeypatch.setattr(main.urllib.request, "urlopen", _boom)
-    main.notify_agent({"status": "READY"})      # 예외가 새어나오면 실패
+    main.notify_agent(main.AGENT_PATH_INGEST, {"status": "READY"})  # 예외가 새면 실패
 
 
 def test_notify_agent_skipped_when_url_is_empty(monkeypatch):
@@ -417,4 +431,4 @@ def test_notify_agent_skipped_when_url_is_empty(monkeypatch):
         raise AssertionError("URL 이 비었는데 요청을 보냈다")
 
     monkeypatch.setattr(main.urllib.request, "urlopen", _never)
-    main.notify_agent({"status": "READY"})
+    main.notify_agent(main.AGENT_PATH_INGEST, {"status": "READY"})

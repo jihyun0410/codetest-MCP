@@ -33,18 +33,24 @@ MCP 는 LLM 을 호출하지 않는다. 코드로 확정 가능한 일(clone/AST
 하고, 판단이 필요한 일만 Agent 로 넘긴다. **모든 command 가 Agent 로 나가지는
 않는다.**
 
-| command | Agent 송신 | event | 비고 |
+| command | Agent 송신 경로 | `event` | 비고 |
 |---|---|---|---|
 | `hello` | ✗ | — | 로컬 에코 |
-| `register_project` | △ | `ingest_completed` | 수집 완료 후. 백그라운드라 응답에 못 실음 |
+| `register_project` | `POST /api/v1/projects` | `ingest_completed` | 수집 완료 후 통보 |
 | `delete_project` | ✗ | — | 삭제 = 코드 작업 |
-| `test_generate` | ✓ | `test_generate_requested` | 코드 생성 = LLM |
-| `test_run` | ✓ | `test_generate_requested` | 생성만. 실행은 MCP 가 직접 |
+| `test_generate` | `POST /api/v1/tests/generate` | `test_generate_requested` | 코드 생성 = LLM |
+| `test_run` | `POST /api/v1/tests/run` | `test_run_requested` | 생성만. 실행은 MCP |
 | `execute_tests` | ✗ | — | gradle 실행 = 코드 작업 |
 
-송신은 전부 `POST {CODETEST_MCP_AGENT_BASE_URL}` 한 곳으로 나가고, 구분은 경로가
-아니라 본문의 `event` 필드로 한다. 코드에서는 `>>> Agent API 송신 <<<` 주석으로
-표시했다.
+경로는 `CODETEST_MCP_AGENT_BASE_URL` 뒤에 붙는다:
+
+```
+base_url = http://maxis-proxy.mks01.test.com:80/agent/1121365
+       → POST http://maxis-proxy.mks01.test.com:80/agent/1121365/api/v1/tests/generate
+```
+
+경로 상수는 [main.py](src/main.py) 상단의 `AGENT_PATH_*` 세 개뿐이라 규격이 바뀌면
+거기만 고치면 된다. 코드에서는 `>>> Agent API 송신 <<<` 주석으로 표시했다.
 
 Agent 응답 중 `test_code` 를 뺀 나머지는 **버리지 않고** `analysis` 로 그대로
 올라온다. 영향도 해석·요약처럼 LLM 이 만든 내용을 터미널에 보여주기 위한 것이라

@@ -16,14 +16,14 @@ MCP 는 LLM 을 호출하지 않는다. 코드로 확정 가능한 일(clone/AST
 하고, 판단이 필요한 일(테스트 코드 생성, 변경 의도·영향도 해석)만 Agent 로
 넘긴다. 그래서 **모든 command 가 Agent 로 나가지는 않는다.**
 
-  command           Agent 송신                       비고
-  ────────────────  ───────────────────────────────  ─────────────────────────
-  hello             ✗                                로컬 에코
-  register_project  △ 수집 완료 후 ingest_completed   백그라운드라 응답에 못 실음
-  delete_project    ✗                                파일/DB 삭제 = 코드 작업
-  test_generate     ✓ test_generate_requested        코드 생성 = LLM
-  test_run          ✓ test_generate_requested        생성만. 실행은 MCP 가 직접
-  execute_tests     ✗                                gradle 실행 = 코드 작업
+  command           Agent 송신 (POST {base_url} + 경로)      비고
+  ────────────────  ──────────────────────────────────────  ────────────────────
+  hello             ✗                                       로컬 에코
+  register_project  △ /api/v1/projects                      수집 완료 후. 통보
+  delete_project    ✗                                       삭제 = 코드 작업
+  test_generate     ✓ /api/v1/tests/generate                코드 생성 = LLM
+  test_run          ✓ /api/v1/tests/run                     생성만. 실행은 MCP
+  execute_tests     ✗                                       gradle 실행 = 코드 작업
 
 송신 지점은 코드에서 `>>> Agent API 송신 <<<` 주석으로 표시했다.
 
@@ -108,17 +108,34 @@ def _base_package(db: Session, project_id: str) -> str | None:
 
 # --- Agent 연동 --------------------------------------------------------------
 #
-#  Agent 와 주고받는 계약은 전부 여기 두 함수에 있다. Agent 쪽 API 규격이
-#  다르면 이 블록만 고치면 된다.
+#  Agent 와 주고받는 계약은 전부 이 블록에 있다. 규격이 바뀌면 여기만 고친다.
 #
-#    통보  MCP -> Agent   {"event": "ingest_completed", ...}          응답 무시
-#    생성  MCP -> Agent   {"event": "test_generate_requested", ...}   {"test_code": "..."}
+#  요청은 base_url 뒤에 command 별 경로를 붙여 POST 한다.
 #
-def _post_agent(payload: dict, timeout: int) -> dict:
+#    command           경로                        본문 event
+#    ────────────────  ──────────────────────────  ─────────────────────────
+#    register_project  /api/v1/projects            ingest_completed
+#    test_generate     /api/v1/tests/generate      test_generate_requested
+#    test_run          /api/v1/tests/run           test_run_requested
+#
+#  예: base_url=http://host/agent/1121365 이면
+#      POST http://host/agent/1121365/api/v1/tests/generate
+#
+AGENT_PATH_INGEST = "/api/v1/projects"
+AGENT_PATH_GENERATE = "/api/v1/tests/generate"
+AGENT_PATH_RUN = "/api/v1/tests/run"
+
+
+def _agent_url(path: str) -> str:
+    """base_url 과 command 경로를 잇는다. 양쪽 슬래시 중복을 막는다."""
+    return f"{settings.agent_base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def _post_agent(path: str, payload: dict, timeout: int) -> dict:
     """Agent 로 JSON 을 POST 하고 응답 본문을 dict 로 돌려준다."""
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
-        settings.agent_base_url,
+        _agent_url(path),
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -156,7 +173,7 @@ def _post_agent(payload: dict, timeout: int) -> dict:
     return json.loads(body) if body.strip() else {}
 
 
-def notify_agent(payload: dict) -> None:
+def notify_agent(path: str, payload: dict) -> None:
     """수집 결과를 Agent 로 통보한다 (fire-and-forget).
 
     Agent 가 죽어 있거나 느려도 결과는 이미 DB 에 있으므로 어떤 실패든 삼키고
@@ -165,16 +182,16 @@ def notify_agent(payload: dict) -> None:
     if not settings.agent_base_url:
         return
     try:
-        _post_agent(payload, timeout=10)
+        _post_agent(path, payload, timeout=10)
         logger.info("Agent 통보 완료: %s", payload.get("status"))
     except Exception as exc:
         logger.warning(
             "Agent 통보 실패 — 수집 결과는 DB 에 남아 있다 (%s): %s",
-            settings.agent_base_url, exc,
+            _agent_url(path), exc,
         )
 
 
-def request_generation(context: GenerationContext) -> dict:
+def request_generation(path: str, event: str, context: GenerationContext) -> dict:
     """정리한 컨텍스트를 Agent 로 넘겨 LLM 처리 결과를 받아온다.
 
     코드 생성과 영향도 해석은 LLM 의 일이라 MCP 가 하지 않는다. 여기서는 Agent 가
@@ -191,15 +208,15 @@ def request_generation(context: GenerationContext) -> dict:
         )
 
     payload = {
-        "event": "test_generate_requested",
+        "event": event,
         "project_id": context.project_id,
         "context": context.model_dump(mode="json"),
     }
     try:
-        answer = _post_agent(payload, timeout=settings.agent_timeout_seconds)
+        answer = _post_agent(path, payload, timeout=settings.agent_timeout_seconds)
     except Exception as exc:
         raise ToolError(
-            f"Agent 로 코드 생성을 요청하지 못했습니다 ({settings.agent_base_url}): {exc}"
+            f"Agent 로 코드 생성을 요청하지 못했습니다 ({_agent_url(path)}): {exc}"
         ) from None
 
     if not (answer.get("test_code") or "").strip():
@@ -234,9 +251,9 @@ def run_ingest(project_id: str) -> None:
 
     if payload:
         logger.info("[%s] 개요 수집 결과: %s", project_id, payload["status"])
-        # >>> Agent API 송신 <<<  POST {AGENT_BASE_URL}  event=ingest_completed
+        # >>> Agent API 송신 <<<  POST {AGENT_BASE_URL}/api/v1/projects
         # 세션을 닫은 뒤에 통보한다 — 네트워크 대기 동안 DB 커넥션을 잡지 않도록
-        notify_agent(payload)
+        notify_agent(AGENT_PATH_INGEST, payload)
     else:
         logger.error("[%s] 개요 수집 결과를 기록하지 못했습니다", project_id)
 
@@ -371,7 +388,7 @@ def hello(name: str) -> str:
 
 # --- 프로젝트 개요 (정의서 상세 1) --------------------------------------------
 # Agent API 송신: 이 도구 안에서는 없음.
-#   수집이 끝난 뒤 백그라운드 스레드가 POST {AGENT_BASE_URL} event=ingest_completed
+#   수집이 끝난 뒤 백그라운드 스레드가 POST {AGENT_BASE_URL}/api/v1/projects
 #   (run_ingest → notify_agent). 응답을 이미 PENDING 으로 보낸 뒤라 통보가 필요하다.
 @mcp.tool()
 def register_project(
@@ -500,6 +517,7 @@ def _build_context(
 
 # --- 테스트 코드 생성 (정의서 (1)) ---------------------------------------------
 # Agent API 송신: ✓ POST {AGENT_BASE_URL}
+#   POST {AGENT_BASE_URL}/api/v1/tests/generate
 #   보냄  {"event": "test_generate_requested", "project_id": …, "context": {…15개 필드}}
 #   받음  {"test_code": "<Java 소스>", ...그 외는 analysis 로 전달}
 @mcp.tool()
@@ -521,9 +539,11 @@ def test_generate(
         project = _project(db, project_id)
         context = _build_context(db, project, diff, sources)
 
-    # >>> Agent API 송신 <<<  POST {AGENT_BASE_URL}  event=test_generate_requested
+    # >>> Agent API 송신 <<<  POST {AGENT_BASE_URL}/api/v1/tests/generate
     # 세션을 닫은 뒤 호출한다 — LLM 생성은 오래 걸리므로 DB 커넥션을 물지 않는다
-    answer = request_generation(context)
+    answer = request_generation(
+        AGENT_PATH_GENERATE, "test_generate_requested", context
+    )
     return TestGenerateResponse(
         project_id=context.project_id,
         test_code=answer["test_code"],
@@ -608,7 +628,8 @@ def execute_tests(
 
 # --- 생성 + 실행 전 과정 (정의서 (1), (2), 상세 4) ------------------------------
 # Agent API 송신: ✓ POST {AGENT_BASE_URL}  (생성 단계 1회. 실행은 MCP 가 직접)
-#   보냄  {"event": "test_generate_requested", "project_id": …, "context": {…}}
+#   POST {AGENT_BASE_URL}/api/v1/tests/run
+#   보냄  {"event": "test_run_requested", "project_id": …, "context": {…}}
 #   받음  {"test_code": "<Java 소스>", ...그 외는 analysis 로 전달}
 @mcp.tool()
 def test_run(
@@ -636,8 +657,8 @@ def test_run(
         project = _project(db, project_id)
         context = _build_context(db, project, diff, sources)
 
-    # >>> Agent API 송신 <<<  POST {AGENT_BASE_URL}  event=test_generate_requested
-    answer = request_generation(context)
+    # >>> Agent API 송신 <<<  POST {AGENT_BASE_URL}/api/v1/tests/run
+    answer = request_generation(AGENT_PATH_RUN, "test_run_requested", context)
     test_code = answer["test_code"]
 
     # 실행은 MCP 몫 — Agent 로 쏘지 않는다 (gradle/JaCoCo 는 코드 기반 처리)
