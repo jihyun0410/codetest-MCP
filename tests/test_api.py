@@ -151,6 +151,8 @@ async def test_generate_returns_agent_code_with_context(client, monkeypatch):
     # Agent 로 넘어간 것: 코드 생성에 필요한 사실
     assert sent["event"] == "test_generate_requested"
     assert sent["path"] == "/api/v1/tests/generate"
+    # Agent 는 최상위에 diff 원문을 요구한다 (422: loc=["body","diff"])
+    assert sent["diff"] == DIFF
     ctx = sent["context"]
     path = "src/main/java/com/example/demo/service/OrderService.java"
     assert path in ctx["changed_ranges"]
@@ -262,6 +264,7 @@ async def test_run_generates_then_executes(client, monkeypatch):
     def _fake_post(path, payload, timeout):
         posted["path"] = path
         posted["event"] = payload["event"]
+        posted["diff"] = payload["diff"]
         return {"test_code": "class T {}", "impact": "영향 없음"}
 
     monkeypatch.setattr(main, "_post_agent", _fake_post)
@@ -291,6 +294,7 @@ async def test_run_generates_then_executes(client, monkeypatch):
     # test_run 은 generate 와 다른 경로/event 로 나간다
     assert posted["path"] == "/api/v1/tests/run"
     assert posted["event"] == "test_run_requested"
+    assert posted["diff"] == DIFF
 
 
 async def test_run_unknown_project_is_rejected(client):

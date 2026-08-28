@@ -191,7 +191,9 @@ def notify_agent(path: str, payload: dict) -> None:
         )
 
 
-def request_generation(path: str, event: str, context: GenerationContext) -> dict:
+def request_generation(
+    path: str, event: str, context: GenerationContext, diff: str = ""
+) -> dict:
     """정리한 컨텍스트를 Agent 로 넘겨 LLM 처리 결과를 받아온다.
 
     코드 생성과 영향도 해석은 LLM 의 일이라 MCP 가 하지 않는다. 여기서는 Agent 가
@@ -207,9 +209,12 @@ def request_generation(path: str, event: str, context: GenerationContext) -> dic
             "CODETEST_MCP_AGENT_BASE_URL 을 확인하세요."
         )
 
+    # Agent 는 최상위에 diff 를 요구한다(422: loc=["body","diff"]).
+    # context 안에는 파싱 결과(changed_ranges)만 있고 원문이 없어 따로 싣는다.
     payload = {
         "event": event,
         "project_id": context.project_id,
+        "diff": diff,
         "context": context.model_dump(mode="json"),
     }
     try:
@@ -518,7 +523,8 @@ def _build_context(
 # --- 테스트 코드 생성 (정의서 (1)) ---------------------------------------------
 # Agent API 송신: ✓ POST {AGENT_BASE_URL}
 #   POST {AGENT_BASE_URL}/api/v1/tests/generate
-#   보냄  {"event": "test_generate_requested", "project_id": …, "context": {…15개 필드}}
+#   보냄  {"event": "test_generate_requested", "project_id": …, "diff": "<원문>",
+#          "context": {…15개 필드}}
 #   받음  {"test_code": "<Java 소스>", ...그 외는 analysis 로 전달}
 @mcp.tool()
 def test_generate(
@@ -542,7 +548,7 @@ def test_generate(
     # >>> Agent API 송신 <<<  POST {AGENT_BASE_URL}/api/v1/tests/generate
     # 세션을 닫은 뒤 호출한다 — LLM 생성은 오래 걸리므로 DB 커넥션을 물지 않는다
     answer = request_generation(
-        AGENT_PATH_GENERATE, "test_generate_requested", context
+        AGENT_PATH_GENERATE, "test_generate_requested", context, diff
     )
     return TestGenerateResponse(
         project_id=context.project_id,
@@ -629,7 +635,8 @@ def execute_tests(
 # --- 생성 + 실행 전 과정 (정의서 (1), (2), 상세 4) ------------------------------
 # Agent API 송신: ✓ POST {AGENT_BASE_URL}  (생성 단계 1회. 실행은 MCP 가 직접)
 #   POST {AGENT_BASE_URL}/api/v1/tests/run
-#   보냄  {"event": "test_run_requested", "project_id": …, "context": {…}}
+#   보냄  {"event": "test_run_requested", "project_id": …, "diff": "<원문>",
+#          "context": {…}}
 #   받음  {"test_code": "<Java 소스>", ...그 외는 analysis 로 전달}
 @mcp.tool()
 def test_run(
@@ -658,7 +665,7 @@ def test_run(
         context = _build_context(db, project, diff, sources)
 
     # >>> Agent API 송신 <<<  POST {AGENT_BASE_URL}/api/v1/tests/run
-    answer = request_generation(AGENT_PATH_RUN, "test_run_requested", context)
+    answer = request_generation(AGENT_PATH_RUN, "test_run_requested", context, diff)
     test_code = answer["test_code"]
 
     # 실행은 MCP 몫 — Agent 로 쏘지 않는다 (gradle/JaCoCo 는 코드 기반 처리)
