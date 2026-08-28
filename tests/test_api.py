@@ -137,7 +137,9 @@ async def test_generate_returns_agent_code_with_context(client, monkeypatch):
     def _fake_post(payload, timeout):
         sent.update(payload)
         sent["timeout"] = timeout
-        return {"test_code": "class GeneratedTest {}"}
+        return {"test_code": "class GeneratedTest {}",
+                "impact": "OrderService.calculateTotal 조건 분기 추가",
+                "risk": "MEDIUM"}
 
     monkeypatch.setattr(main, "_post_agent", _fake_post)
     monkeypatch.setattr(settings, "agent_base_url", "http://agent.test/agent/1")
@@ -155,6 +157,10 @@ async def test_generate_returns_agent_code_with_context(client, monkeypatch):
     # 돌려받은 것: Agent 가 생성한 코드 + 근거
     assert body["test_code"] == "class GeneratedTest {}"
     assert body["context"]["graph_ready"] is False
+    # LLM 이 만든 나머지(영향도 해석 등)는 버리지 않고 analysis 로 올라온다
+    assert body["analysis"]["risk"] == "MEDIUM"
+    assert "calculateTotal" in body["analysis"]["impact"]
+    assert "test_code" not in body["analysis"]
 
 
 async def test_generate_requires_agent_url(client, monkeypatch):
@@ -248,7 +254,8 @@ async def test_run_generates_then_executes(client, monkeypatch):
 
     monkeypatch.setattr(settings, "agent_base_url", "http://agent.test/agent/1")
     monkeypatch.setattr(main, "_post_agent",
-                        lambda payload, timeout: {"test_code": "class T {}"})
+                        lambda payload, timeout: {"test_code": "class T {}",
+                                                  "impact": "영향 없음"})
     monkeypatch.setattr(
         main.RepoService, "ensure_clone", lambda self, branch=None: pathlib.Path("/tmp/x")
     )
@@ -271,6 +278,7 @@ async def test_run_generates_then_executes(client, monkeypatch):
     assert body["execution"]["passed"] == 2
     # 생성 근거도 함께 돌아온다
     assert body["context"]["project_id"] == project_id
+    assert body["analysis"]["impact"] == "영향 없음"
 
 
 async def test_run_unknown_project_is_rejected(client):

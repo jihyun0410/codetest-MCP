@@ -9,16 +9,23 @@
     python -m src     # 패키지라 -m 으로 띄운다 (main.py 직접 실행은 import 실패)
     → http(streamable), 0.0.0.0:8100 (CODETEST_MCP_TRANSPORT / _HOST / _PORT 로 변경)
 
-도구 (hello 외 전부 정의서 근거)
-  hello             연결 확인용 에코
-  register_project  프로젝트 등록 + Git clone + AST → 개요 DB 저장   (상세 1)
-  delete_project    등록 정보/그래프/작업 사본 삭제
-  test_generate     컨텍스트 정리 → Agent 가 테스트 코드 생성        (1)
-  test_run          생성 + @SpringBootTest 주입 + JaCoCo 실행 전 과정 (1),(2),(상세 4)
-  execute_tests     이미 있는 테스트 코드를 실행만                   (상세 4)
+구조:  CLI Server  ──command──▶  MCP  ──LLM 이 필요한 것만──▶  AI Agent
+                                  ◀── LLM 처리 결과 ──────────
 
-코드 생성과 변경 의도/영향도 해석은 Agent(LLM) 가 한다. MCP 는 그 판단에
-필요한 사실을 정리해 넘기고, 돌려받은 코드를 실행한다.
+MCP 는 LLM 을 호출하지 않는다. 코드로 확정 가능한 일(clone/AST/gradle)은 직접
+하고, 판단이 필요한 일(테스트 코드 생성, 변경 의도·영향도 해석)만 Agent 로
+넘긴다. 그래서 **모든 command 가 Agent 로 나가지는 않는다.**
+
+  command           Agent 송신                       비고
+  ────────────────  ───────────────────────────────  ─────────────────────────
+  hello             ✗                                로컬 에코
+  register_project  △ 수집 완료 후 ingest_completed   백그라운드라 응답에 못 실음
+  delete_project    ✗                                파일/DB 삭제 = 코드 작업
+  test_generate     ✓ test_generate_requested        코드 생성 = LLM
+  test_run          ✓ test_generate_requested        생성만. 실행은 MCP 가 직접
+  execute_tests     ✗                                gradle 실행 = 코드 작업
+
+송신 지점은 코드에서 `>>> Agent API 송신 <<<` 주석으로 표시했다.
 
 개요 수집이 끝나면 CODETEST_MCP_AGENT_BASE_URL 로 결과를 POST 한다.
 """
@@ -167,12 +174,15 @@ def notify_agent(payload: dict) -> None:
         )
 
 
-def request_test_code(context: GenerationContext) -> str:
-    """정리한 컨텍스트를 Agent 로 넘겨 테스트 코드를 생성받는다.
+def request_generation(context: GenerationContext) -> dict:
+    """정리한 컨텍스트를 Agent 로 넘겨 LLM 처리 결과를 받아온다.
 
-    코드 생성은 LLM 의 일이라 MCP 가 하지 않는다. 여기서는 Agent 가 판단에
-    필요한 사실을 넘기고 결과를 받아올 뿐이다. 통보와 달리 이 응답이 없으면
+    코드 생성과 영향도 해석은 LLM 의 일이라 MCP 가 하지 않는다. 여기서는 Agent 가
+    판단에 필요한 사실을 넘기고 결과를 받아올 뿐이다. 통보와 달리 이 응답이 없으면
     할 일이 없으므로 실패를 삼키지 않고 그대로 올린다.
+
+    응답 **전체**를 돌려준다. test_code 만 꺼내고 나머지를 버리면 Agent 가 만든
+    영향도 해석·요약이 사라져 터미널에 보여줄 수 없다.
     """
     if not settings.agent_base_url:
         raise ToolError(
@@ -192,13 +202,17 @@ def request_test_code(context: GenerationContext) -> str:
             f"Agent 로 코드 생성을 요청하지 못했습니다 ({settings.agent_base_url}): {exc}"
         ) from None
 
-    test_code = (answer.get("test_code") or "").strip()
-    if not test_code:
+    if not (answer.get("test_code") or "").strip():
         raise ToolError(
             "Agent 응답에 test_code 가 없습니다. 응답 형식은 "
-            '{"test_code": "<Java 소스>"} 여야 합니다.'
+            '{"test_code": "<Java 소스>", ...} 여야 합니다.'
         )
-    return test_code
+    logger.info(
+        "Agent 생성 결과 수신 — test_code %d자, 추가 필드: %s",
+        len(answer["test_code"]),
+        ", ".join(k for k in answer if k != "test_code") or "(없음)",
+    )
+    return answer
 
 
 # --- 백그라운드 수집 ---------------------------------------------------------
@@ -220,6 +234,7 @@ def run_ingest(project_id: str) -> None:
 
     if payload:
         logger.info("[%s] 개요 수집 결과: %s", project_id, payload["status"])
+        # >>> Agent API 송신 <<<  POST {AGENT_BASE_URL}  event=ingest_completed
         # 세션을 닫은 뒤에 통보한다 — 네트워크 대기 동안 DB 커넥션을 잡지 않도록
         notify_agent(payload)
     else:
@@ -347,6 +362,7 @@ mcp = FastMCP(
 
 
 # --- 연결 확인 ----------------------------------------------------------------
+# Agent API 송신: 없음 (로컬 에코)
 @mcp.tool()
 def hello(name: str) -> str:
     """연결 확인용 에코. 이름을 그대로 돌려준다."""
@@ -354,6 +370,9 @@ def hello(name: str) -> str:
 
 
 # --- 프로젝트 개요 (정의서 상세 1) --------------------------------------------
+# Agent API 송신: 이 도구 안에서는 없음.
+#   수집이 끝난 뒤 백그라운드 스레드가 POST {AGENT_BASE_URL} event=ingest_completed
+#   (run_ingest → notify_agent). 응답을 이미 PENDING 으로 보낸 뒤라 통보가 필요하다.
 @mcp.tool()
 def register_project(
     name: Annotated[str, Field(min_length=1, max_length=200, description="프로젝트 명")],
@@ -397,6 +416,9 @@ def register_project(
         return _to_read(project)
 
 
+# Agent API 송신: 없음.
+#   삭제는 코드로 끝나는 작업이고 결과는 이 호출의 반환값으로 이미 전달된다.
+#   이력 관리를 위해 통보가 필요해지면 여기에 notify_agent() 를 추가하면 된다.
 @mcp.tool()
 def delete_project(project_id: str) -> dict:
     """프로젝트와 그래프를 함께 삭제하고 작업 사본(clone)도 제거한다."""
@@ -477,6 +499,9 @@ def _build_context(
 
 
 # --- 테스트 코드 생성 (정의서 (1)) ---------------------------------------------
+# Agent API 송신: ✓ POST {AGENT_BASE_URL}
+#   보냄  {"event": "test_generate_requested", "project_id": …, "context": {…15개 필드}}
+#   받음  {"test_code": "<Java 소스>", ...그 외는 analysis 로 전달}
 @mcp.tool()
 def test_generate(
     project_id: str,
@@ -496,10 +521,14 @@ def test_generate(
         project = _project(db, project_id)
         context = _build_context(db, project, diff, sources)
 
+    # >>> Agent API 송신 <<<  POST {AGENT_BASE_URL}  event=test_generate_requested
     # 세션을 닫은 뒤 호출한다 — LLM 생성은 오래 걸리므로 DB 커넥션을 물지 않는다
-    test_code = request_test_code(context)
+    answer = request_generation(context)
     return TestGenerateResponse(
-        project_id=context.project_id, test_code=test_code, context=context
+        project_id=context.project_id,
+        test_code=answer["test_code"],
+        analysis={k: v for k, v in answer.items() if k != "test_code"},
+        context=context,
     )
 
 
@@ -552,6 +581,9 @@ def _execute(
     )
 
 
+# Agent API 송신: 없음.
+#   @SpringBootTest 주입과 gradle/JaCoCo 실행은 전부 코드 기반 처리라 LLM 이
+#   필요 없다. 결과는 반환값으로 전달된다. (실행 결과 통보가 필요하면 _execute 에)
 @mcp.tool()
 def execute_tests(
     project_id: str,
@@ -575,6 +607,9 @@ def execute_tests(
 
 
 # --- 생성 + 실행 전 과정 (정의서 (1), (2), 상세 4) ------------------------------
+# Agent API 송신: ✓ POST {AGENT_BASE_URL}  (생성 단계 1회. 실행은 MCP 가 직접)
+#   보냄  {"event": "test_generate_requested", "project_id": …, "context": {…}}
+#   받음  {"test_code": "<Java 소스>", ...그 외는 analysis 로 전달}
 @mcp.tool()
 def test_run(
     project_id: str,
@@ -601,12 +636,17 @@ def test_run(
         project = _project(db, project_id)
         context = _build_context(db, project, diff, sources)
 
-    test_code = request_test_code(context)
+    # >>> Agent API 송신 <<<  POST {AGENT_BASE_URL}  event=test_generate_requested
+    answer = request_generation(context)
+    test_code = answer["test_code"]
+
+    # 실행은 MCP 몫 — Agent 로 쏘지 않는다 (gradle/JaCoCo 는 코드 기반 처리)
     execution = _execute(project_id, test_code, sources, base_package or context.base_package)
 
     return TestRunResponse(
         project_id=context.project_id,
         test_code=test_code,
+        analysis={k: v for k, v in answer.items() if k != "test_code"},
         context=context,
         execution=execution,
     )

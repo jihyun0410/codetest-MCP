@@ -137,6 +137,9 @@ class TestGenerateResponse(BaseModel):
     project_id: str
     #: Agent(LLM)가 생성해 돌려준 Java 테스트 소스
     test_code: str
+    #: Agent 응답 중 test_code 외의 전부 — 영향도 해석·요약 등 LLM 이 만든 내용.
+    #: 규격을 MCP 가 정하지 않는다(LLM 산출물이라). 받은 그대로 터미널로 넘긴다.
+    analysis: dict = Field(default_factory=dict)
     #: MCP 가 정리해 Agent 로 넘긴 사실 (Agent 가 무엇을 보고 썼는지 추적용)
     context: GenerationContext
 
@@ -146,6 +149,8 @@ class TestRunResponse(BaseModel):
 
     project_id: str
     test_code: str
+    #: Agent 응답 중 test_code 외의 전부 (영향도 해석 등)
+    analysis: dict = Field(default_factory=dict)
     context: GenerationContext
     #: @SpringBootTest 주입 + JaCoCo 실행 결과 (판정 없이 사실만)
     execution: ExecuteResponse

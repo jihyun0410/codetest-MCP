@@ -22,6 +22,34 @@ Agent 에게 돌려준다. Agent 는 MCP 클라이언트로 붙어 도구를 호
 — 전부 Agent(LLM)의 몫이다. `test_generate` / `test_run` 은 그 판단에 필요한 사실을
 정리해 `CODETEST_MCP_AGENT_BASE_URL` 로 넘기고 결과를 받아온다.
 
+## 구조
+
+```
+CLI Server  ──command──▶  MCP  ──LLM 이 필요한 것만──▶  AI Agent
+                           ◀── LLM 처리 결과 ──────────
+```
+
+MCP 는 LLM 을 호출하지 않는다. 코드로 확정 가능한 일(clone/AST/gradle)은 직접
+하고, 판단이 필요한 일만 Agent 로 넘긴다. **모든 command 가 Agent 로 나가지는
+않는다.**
+
+| command | Agent 송신 | event | 비고 |
+|---|---|---|---|
+| `hello` | ✗ | — | 로컬 에코 |
+| `register_project` | △ | `ingest_completed` | 수집 완료 후. 백그라운드라 응답에 못 실음 |
+| `delete_project` | ✗ | — | 삭제 = 코드 작업 |
+| `test_generate` | ✓ | `test_generate_requested` | 코드 생성 = LLM |
+| `test_run` | ✓ | `test_generate_requested` | 생성만. 실행은 MCP 가 직접 |
+| `execute_tests` | ✗ | — | gradle 실행 = 코드 작업 |
+
+송신은 전부 `POST {CODETEST_MCP_AGENT_BASE_URL}` 한 곳으로 나가고, 구분은 경로가
+아니라 본문의 `event` 필드로 한다. 코드에서는 `>>> Agent API 송신 <<<` 주석으로
+표시했다.
+
+Agent 응답 중 `test_code` 를 뺀 나머지는 **버리지 않고** `analysis` 로 그대로
+올라온다. 영향도 해석·요약처럼 LLM 이 만든 내용을 터미널에 보여주기 위한 것이라
+MCP 가 규격을 정하지 않는다.
+
 ## 도구 (`@mcp.tool`)
 
 | 도구 | 설명 |
@@ -60,6 +88,10 @@ Agent 에게 돌려준다. Agent 는 MCP 클라이언트로 붙어 도구를 호
 // 응답
 {
   "test_code": "…Agent 가 생성한 Java 소스…",
+  "analysis": {                         // Agent 응답 중 test_code 외 전부
+    "impact": "calculateTotal 에 할인 분기 추가", "risk": "MEDIUM",
+    "suggested_cases": ["수량 10 이하", "수량 11 이상"]
+  },
   "context": {                          // 무엇을 보고 생성했는지
     "base_package": "com.example.demo", "frameworks": ["Spring Boot"],
     "changed_units":  [{"qualified_name": "…OrderService#calculateTotal(Order)",
@@ -78,7 +110,8 @@ Agent 에게 돌려준다. Agent 는 MCP 클라이언트로 붙어 도구를 호
 함께 반환한다.
 
 ```jsonc
-{ "test_code": "…", "context": { … }, "execution": { "passed": 3, "coverage": {…}, … } }
+{ "test_code": "…", "analysis": { … }, "context": { … },
+  "execution": { "passed": 3, "coverage": {…}, … } }
 ```
 
 LLM 생성 + gradle 빌드가 연달아 일어나므로 응답까지 **수 분**이 걸릴 수 있다.
