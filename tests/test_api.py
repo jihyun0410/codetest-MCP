@@ -20,6 +20,7 @@ from codetest_mcp.config import settings
 from codetest_mcp.db import Base
 from codetest_mcp.executor import ExecutionResult
 from codetest_mcp.main import mcp
+from codetest_mcp.schemas import SourceFilePayload
 from codetest_mcp.springboot import PreparedTest
 
 ORDER_PATH = "src/main/java/com/example/demo/service/OrderService.java"
@@ -173,12 +174,17 @@ async def _register(client, name="demo") -> str:
 # --- 도구 목록 — CLI 가 부르는 이름이 전부 있어야 한다 --------------------------
 async def test_exposes_every_tool_the_cli_calls(client):
     names = {t.name for t in await client.list_tools()}
-    assert {
+    assert names == {
         "hello", "register_project", "delete_project",
         "test_generate", "test_run", "execute_tests",
-    } <= names
-    # 코드 기반 조회 도구
-    assert {"analyze_changes", "get_project_overview"} <= names
+    }
+
+
+async def test_internal_steps_are_not_exposed_as_tools(client):
+    """개요 조회와 변경 단위 식별은 CLI 가 부르지 않는다 — 도구로 내보내지 않는다."""
+    names = {t.name for t in await client.list_tools()}
+    assert "get_project_overview" not in names
+    assert "analyze_changes" not in names
 
 
 async def test_hello_reports_agent_status(client, agent):
@@ -222,35 +228,47 @@ async def test_delete_project(client, monkeypatch):
 
 
 # --- 변경 단위 + 기능 중요도 (정의서 (2), [UI] 4) — LLM 미개입 ------------------
-async def test_analyze_identifies_changes_without_the_agent(client, agent):
-    project_id = await _register(client)
-    body = await _call(client, "analyze_changes",
-                       project_id=project_id, diff=DIFF, sources=SOURCES)
+def _payloads(sources: list[dict]) -> list[SourceFilePayload]:
+    return [SourceFilePayload(**item) for item in sources]
 
-    assert ORDER_PATH in body["changed_ranges"]
-    assert body["risk"] in {"LOW", "MEDIUM", "HIGH"}
-    assert body["importance"] in {"HIGH", "MID", "LOW"}
-    assert "영향도 점수" in body["importance_rationale"]
+
+async def test_analyze_identifies_changes_without_the_agent(client, agent):
+    """도구는 아니지만 test_generate/test_run 의 첫 단계다 — 사실만 만든다."""
+    project_id = await _register(client)
+    body = orchestrator.analyze(project_id, DIFF, _payloads(SOURCES))
+
+    assert ORDER_PATH in body.changed_ranges
+    assert body.risk in {"LOW", "MEDIUM", "HIGH"}
+    assert body.importance in {"HIGH", "MID", "LOW"}
+    assert "영향도 점수" in body.importance_rationale
     assert agent.calls == []          # 중요도 판단에 LLM 을 쓰지 않는다
 
 
 async def test_analyze_uses_sources_when_the_diff_has_no_hunk(client):
     project_id = await _register(client)
-    body = await _call(client, "analyze_changes", project_id=project_id, diff="",
-                       sources=[{"path": "src/main/java/A.java", "content": "class A {}\nint x;\n"}])
-    assert body["changed_ranges"]["src/main/java/A.java"] == [[1, 3]]
+    body = orchestrator.analyze(
+        project_id, "",
+        _payloads([{"path": "src/main/java/A.java", "content": "class A {}\nint x;\n"}]),
+    )
+    assert body.changed_ranges["src/main/java/A.java"] == [(1, 3)]
 
 
 async def test_analyze_warns_when_overview_not_ready(client):
     project_id = await _register(client)     # ingest 는 스텁이라 PENDING 상태
-    body = await _call(client, "analyze_changes", project_id=project_id, diff=DIFF)
-    assert body["graph_ready"] is False
-    assert any("개요 수집" in w for w in body["warnings"])
+    body = orchestrator.analyze(project_id, DIFF, [])
+    assert body.graph_ready is False
+    assert any("개요 수집" in w for w in body.warnings)
 
 
 async def test_analyze_unknown_project_is_rejected(client):
+    with pytest.raises(orchestrator.FlowError, match="찾을 수 없습니다"):
+        orchestrator.analyze("nope", "", [])
+
+
+async def test_generate_surfaces_the_unknown_project_as_a_tool_error(client):
+    """내부 단계로 내려가도 CLI 는 같은 메시지를 본다."""
     with pytest.raises(ToolError, match="찾을 수 없습니다"):
-        await _call(client, "analyze_changes", project_id="nope", diff="")
+        await _call(client, "test_generate", project_id="nope", diff="")
 
 
 # --- CLI `codetest generate` ---------------------------------------------------

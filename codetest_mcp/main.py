@@ -16,11 +16,13 @@ LLM 판단이 필요한 부분만 Agent(codetest)에 FastAPI 로 넘긴 뒤 결�
   hello                 연결 확인용 에코
   register_project      프로젝트 등록 + Git clone + AST → 개요 DB 저장   (상세 1)
   delete_project        등록 정보/그래프/작업 사본 삭제
-  get_project_overview  저장된 프로젝트 개요 조회                        (상세 1)
-  analyze_changes       Git Diff + AST 변경 단위·영향도·중요도 식별      (2), [UI] 4
   test_generate         codetest generate — 분석 → Agent 생성
   test_run              codetest run      — 분석 → 생성 → 실행 → 판정
   execute_tests         codetest test     — 실행 → 판정                 (1), (상세 4)
+
+프로젝트 개요 조회와 변경 단위 식별은 **도구로 노출하지 않는다.** CLI 가 직접 쓸 일이
+없고, test_generate / test_run 이 내부에서(`orchestrator.analyze`) 만들어 쓰는 중간
+산출물이다. 개요 수집이 끝나지 않았으면 test_generate 응답의 analysis_warnings 로 알린다.
 
 기능 중요도(High/Mid/Low)는 Agent 에 묻지 않는다. 코드 그래프로 확정하는 값이라
 MCP 가 정한다 (`importance.py`).
@@ -46,13 +48,10 @@ from codetest_mcp.agent_client import AgentError, agent_client
 from codetest_mcp.config import get_logger, settings, setup_logging, verify_api_key
 from codetest_mcp.db import IngestStatus, Project, init_db, session_scope
 from codetest_mcp.graph.builder import GraphBuilder
-from codetest_mcp.graph.store import GraphStore
-from codetest_mcp.orchestrator import FlowError, base_package, project_or_fail
+from codetest_mcp.orchestrator import FlowError, project_or_fail
 from codetest_mcp.repo import RepoService
 from codetest_mcp.schemas import (
-    ChangeAnalysisResponse,
     GeneratedResult,
-    OverviewResponse,
     ProjectRead,
     ReportResult,
     RunResult,
@@ -177,7 +176,7 @@ def register_project(
     """프로젝트를 등록하고 Git clone + AST 개요 수집을 백그라운드로 시작한다.
 
     즉시 ingest_status=PENDING 으로 반환한다. 수집 완료 여부는
-    get_project_overview 로 확인한다 (PENDING → RUNNING → READY/FAILED).
+    test_generate 응답의 analysis_warnings 로 알린다 (PENDING → RUNNING → READY/FAILED).
     """
     if not git_url.startswith(("http://", "https://", "git@")):
         raise ToolError("git_url 은 http(s):// 또는 git@ 형식이어야 합니다.")
@@ -213,46 +212,6 @@ def delete_project(project_id: str) -> dict:
 
     repo.remove()
     return {"deleted": project_id}
-
-
-@mcp.tool()
-def get_project_overview(project_id: str) -> OverviewResponse:
-    """DB 에 저장된 프로젝트 개요를 돌려준다.
-
-    프레임워크, 언어 비중, 그래프 노드/간선 수, @SpringBootApplication 기준 패키지.
-    """
-    with session_scope() as db:
-        project = _flow(project_or_fail, db, project_id)
-        store = GraphStore(db, project.id)
-        return OverviewResponse(
-            project_id=project.id,
-            name=project.name,
-            ingest_status=project.ingest_status,
-            ingest_error=project.ingest_error,
-            frameworks=project.frameworks or [],
-            language_stats=project.language_stats or {},
-            node_counts=store.counts_by_type(),
-            edge_counts=store.edge_counts_by_type(),
-            base_package=base_package(db, project.id),
-            last_indexed_at=project.last_indexed_at,
-        )
-
-
-# --- 변경 코드 식별 + 기능 중요도 (정의서 (2), [UI] 4) --------------------------
-@mcp.tool()
-def analyze_changes(
-    project_id: str,
-    diff: Annotated[str, Field(description="변경분 unified diff")] = "",
-    sources: Annotated[
-        list[SourceFilePayload],
-        Field(description="미커밋 변경 파일 본문 (Diff 에 hunk 가 없는 파일의 구간용)"),
-    ] = [],  # noqa: B006 — 읽기 전용. pydantic 이 호출마다 복사한다
-) -> ChangeAnalysisResponse:
-    """Git Diff 와 AST 로 변경된 코드 단위·영향도·기능 중요도를 식별한다.
-
-    LLM 을 쓰지 않는다. 의도(기능 추가/조건 변경/성능 개선) 해석만 Agent 의 몫이다.
-    """
-    return _flow(orchestrator.analyze, project_id, diff, sources)
 
 
 # --- CLI 명령 흐름 -------------------------------------------------------------
