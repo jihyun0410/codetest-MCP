@@ -1,12 +1,11 @@
 """MCP 도구 응답 스키마.
 
-CLI(codereview_gitver)가 MCP 로 호출하는 계약이다. 요청 파라미터는 도구 시그니처가
-그대로 JSON Schema 가 되므로 여기엔 없다.
+MCP 가 진입점이다. CLI 가 도구를 호출하면 MCP 가 코드 기반 사실을 확정하고,
+LLM 판단이 필요한 부분만 Agent(codetest)에 REST 로 넘긴 뒤 결과를 합쳐 돌려준다.
+요청 파라미터는 도구 시그니처가 그대로 JSON Schema 가 되므로 여기엔 없다.
 
-흐름은 **CLI → MCP → Agent** 다. MCP 응답은 두 가지가 섞인다.
-  · 코드로 확정한 사실 — 변경 단위·영향도·기능 중요도·실행 집계·커버리지
-  · Agent(LLM)가 돌려준 판단 — 변경 의도·사고의 사슬·Test Code·적절성 판정
-CLI 는 이 둘을 하나의 결과 화면으로 보여 준다.
+  ChangeAnalysis / Execute  — 코드로 확정한 사실 (LLM 미개입)
+  Generated / Report / Run  — 위 사실에 Agent 의 LLM 판단을 합친 최종 결과
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ class SourceFilePayload(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-#  register_project — 프로젝트 개요 (정의서 상세 1)
+#  register_project / get_project_overview — 프로젝트 개요 (정의서 상세 1)
 # ---------------------------------------------------------------------------
 class ProjectRead(BaseModel):
     """github_token 은 보유 여부만 노출한다."""
@@ -44,10 +43,24 @@ class ProjectRead(BaseModel):
     has_github_token: bool = False
 
 
+class OverviewResponse(BaseModel):
+    """DB 에 저장된 프로젝트 개요 (정의서: "프로젝트 개요를 파악하고 DB에 저장함")."""
+
+    project_id: str
+    name: str
+    ingest_status: str
+    ingest_error: str | None = None
+    frameworks: list[str] = Field(default_factory=list)
+    language_stats: dict = Field(default_factory=dict)
+    node_counts: dict = Field(default_factory=dict)
+    edge_counts: dict = Field(default_factory=dict)
+    #: @SpringBootApplication 이 있는 기준 패키지 (테스트 배치에 사용)
+    base_package: str | None = None
+    last_indexed_at: datetime | None = None
+
+
 # ---------------------------------------------------------------------------
-#  변경 단위 식별 — Git Diff + AST (정의서 (2))
-#  도구로 노출하지 않는다. test_generate / test_run 이 내부에서 만들어
-#  Agent 프롬프트 입력으로 넘기는 중간 산출물이다.
+#  analyze_changes — Git Diff + AST 변경 단위 식별 (정의서 (2))
 # ---------------------------------------------------------------------------
 class ChangedUnit(BaseModel):
     """Diff 라인과 겹치는 것으로 확정된 코드 단위."""
@@ -76,10 +89,12 @@ class ImpactedUnit(BaseModel):
     via: str | None = None
 
 
-class ChangeAnalysis(BaseModel):
+class ChangeAnalysisResponse(BaseModel):
     """AST/그래프가 확정한 사실. 의도 해석은 Agent 가 한다."""
 
     project_id: str
+    #: 분석한 원본 unified diff — Agent 프롬프트에 그대로 들어간다
+    diff: str = ""
     #: 변경된 파일 → 변경 라인 구간
     changed_ranges: dict[str, list[tuple[int, int]]] = Field(default_factory=dict)
     changed_units: list[ChangedUnit] = Field(default_factory=list)
@@ -89,6 +104,9 @@ class ChangeAnalysis(BaseModel):
     risk: str = "LOW"
     risk_score: int = 0
     risk_reasons: list[str] = Field(default_factory=list)
+    #: [UI 4] 기능 중요도 HIGH / MID / LOW — 코드 그래프로 확정한다 (importance.py)
+    importance: str = "LOW"
+    importance_rationale: str = ""
     #: 개요 (Agent 프롬프트 컨텍스트용)
     frameworks: list[str] = Field(default_factory=list)
     base_package: str | None = None
@@ -98,64 +116,12 @@ class ChangeAnalysis(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-#  기능 중요도 — 코드 기반 판정 (정의서 [UI] 4)
+#  execute_tests — @SpringBootTest + JaCoCo 실행 (정의서 상세 4)
 # ---------------------------------------------------------------------------
-class ImportanceMixin(BaseModel):
-    """High / Mid / Low 와 **그렇게 판단한 근거**.
-
-    정의서 [UI] 4 + 흐름 3 "반드시 어떠한 근거로 표시하는지 명확히 제시해야 함".
-    CLI 는 등급과 근거를 결과 화면에 함께 출력한다.
-    """
-
-    importance: str = "LOW"
-    importance_score: int = 0
-    #: 등급이 나온 이유 (한 줄에 하나) — 결과 화면에 그대로 실린다
-    importance_rationale: str = ""
-    importance_reasons: list[str] = Field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-#  test_generate — 변경 분석 + 중요도(MCP) + Test Code 생성(Agent)
-# ---------------------------------------------------------------------------
-class GeneratedTest(ImportanceMixin):
-    """CLI `codetest generate` 응답.
-
-    MCP 가 확정한 사실(중요도·기준 패키지)과 Agent 가 만든 판단(의도·사고의 사슬·
-    Test Code)을 합쳐 돌려준다.
-    """
-
-    project_id: str = ""
-    #: --- Agent(LLM) 판단 ---
-    thinking: str = ""
-    intent: str = ""
-    intent_rationale: str = ""
-    test_cases: str = ""
-    test_code: str = ""
-    rationale: str = ""
-    target_code: str = ""
-    #: --- MCP 가 코드로 확정한 사실 ---
-    base_package: str | None = None
-    risk: str = "LOW"
-    risk_score: int = 0
-    changed_units: list[ChangedUnit] = Field(default_factory=list)
-    affected_files: list[str] = Field(default_factory=list)
-    #: 그래프 미수집 등 CLI 가 사용자에게 알려야 하는 주의 사항
-    analysis_warnings: list[str] = Field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-#  execute_tests — @SpringBootTest + JaCoCo 실행 (정의서 상세 4) + 적절성 판단
-# ---------------------------------------------------------------------------
-class ExecuteResponse(ImportanceMixin):
-    """CLI `codetest test` 응답 (= `test_run` 의 report).
-
-    실행 집계·커버리지·기능 중요도는 MCP 가 코드로 확정한 사실이고,
-    적절성 판정(verdict)과 변경 의도는 Agent(LLM)가 돌려준 판단이다.
-    """
+class ExecuteResponse(BaseModel):
+    """실행 사실만 담는다. 적절성 판정은 Agent 가 한다."""
 
     project_id: str
-    #: PASS / FAIL — JUnit 집계와 gradle exit code 로 확정한다
-    result: str = "PASS"
     exit_code: int = 0
     output: str = ""
     passed: int = 0
@@ -174,19 +140,71 @@ class ExecuteResponse(ImportanceMixin):
     #: 실제 실행한 gradle 명령
     command: list[str] = Field(default_factory=list)
 
-    #: --- Agent(LLM) 판단 ---
+
+# ---------------------------------------------------------------------------
+#  CLI 가 받는 최종 결과 — MCP 의 사실 + Agent 의 LLM 판단을 합친 것
+# ---------------------------------------------------------------------------
+class GeneratedResult(BaseModel):
+    """`test_generate` / `test_run` 의 생성 결과 (CLI `codetest generate`)."""
+
+    #: [상세 2] 사고의 사슬 — Agent
+    thinking: str = ""
+    #: (2) 변경 의도와 근거 — Agent
+    intent: str = ""
+    intent_rationale: str = ""
+    #: [UI 4] 기능 중요도 — **MCP** 가 코드 그래프로 판단
+    importance: str = "LOW"
+    importance_rationale: str = ""
+    #: (3) 정상/실패 케이스 — Agent
+    test_cases: str = ""
+    #: @SpringBootTest 테스트 코드 — Agent
+    test_code: str = ""
+    rationale: str = ""
+    #: 테스트 대상 코드 (CLI "Test Code 보기")
+    target_code: str = ""
+    #: MCP 가 추론한 기준 패키지 — 실행 시 그대로 쓴다
+    base_package: str | None = None
+    #: MCP 개요 수집 완료 여부 / 경고
+    graph_ready: bool = True
+    analysis_warnings: list[str] = Field(default_factory=list)
+
+
+class ReportResult(BaseModel):
+    """`test_run` / `execute_tests` 의 실행+판정 결과 (CLI `codetest test`)."""
+
+    #: PASS / FAIL — gradle exit code 가 사실이다
+    result: str = "FAIL"
+    #: [UI 3] 결과 적절성 판단과 근거 — Agent
     verdict: str = ""
     verdict_rationale: str = ""
     details: str = ""
+
+    #: (2) "파악한 의도와 근거를 <Test Result 보기>의 결과값에 넣는다"
     intent: str = ""
     intent_rationale: str = ""
+    #: [UI 4] 기능 중요도 — **MCP** 가 코드 그래프로 판단
+    importance: str = "LOW"
+    importance_rationale: str = ""
+
+    # --- MCP 가 확정한 실행 사실 ---
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    total: int = 0
+    failures: list[str] = Field(default_factory=list)
+    #: [상세 4] JaCoCo 커버리지
+    coverage: dict | None = None
+    jacoco_enabled: bool = False
+    #: (1) "생성된 Test Code를 @SpringBootTest 에 넣고 실행"
+    springboot_applied: bool = False
+    applied: list[str] = Field(default_factory=list)
+    test_file_path: str = ""
+    exit_code: int = 0
+    output: str = ""
 
 
-# ---------------------------------------------------------------------------
-#  test_run — 생성 + 실행을 한 번에 (CLI `codetest run`)
-# ---------------------------------------------------------------------------
-class RunResponse(BaseModel):
-    """생성 결과와 실행 리포트를 함께 돌려준다."""
+class RunResult(BaseModel):
+    """`test_run` — 생성과 판정을 함께 돌려준다 (CLI `codetest run`)."""
 
-    generated: GeneratedTest
-    report: ExecuteResponse
+    generated: GeneratedResult
+    report: ReportResult

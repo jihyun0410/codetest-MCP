@@ -1,136 +1,125 @@
-"""
-기능 중요도 판정 (코드 기반, LLM 미사용).
+"""기능 중요도 판단 (코드 기반).
 
 정의서:
-  · [UI] 4  "기능 중요도 : High / Mid / Low"
-  · 흐름 3  "영향도 등급 … 반드시 어떠한 근거로 영향도를 표시하는지(Rationale)를
-             명확히 제시해야 함"
+  "LLM을 사용하여 판단하는 부분은 Agent, **코드 기반으로 단순 처리 및 판단을
+   진행하는 부분은 MCP** 로 구분"
+  "[UI] 4. 기능 중요도 High / Mid / Low"
 
-중요도는 **그래프가 확정한 사실**(변경 단위, 파급 노드, 진입점/SQL 도달, 변경 규모)
-만으로 결정된다. 해석이 아니라 규칙 적용이므로 MCP 의 책임이다.
+중요도는 **LLM 없이** 정한다. AST 로 만든 코드 그래프에서 파급 범위를 세어 나온
+사실만 쓰므로 같은 입력이면 항상 같은 답이 나오고, 근거가 숫자로 남는다.
 
-판정 방식
-  1. `ImpactAnalyzer` 가 산출한 0~100 점수를 임계값으로 3단계에 매핑한다.
-  2. 점수만으로 놓치는 위험은 **승격 규칙**으로 올린다.
-       · 사용자 노출 진입점(Controller 매핑)에 영향  → 최소 MID
-       · 진입점 + SQL 이 함께 걸림                    → HIGH
-       · SQL 실행 지점에 영향                         → 최소 MID
-  3. 판단에 실제로 쓰인 근거만 rationale 로 남긴다 (UI 가 그대로 보여 준다).
+판단 기준
+  1. 그래프 영향도 점수(0~100) → 기본 등급          HIGH / MID / LOW
+  2. 사용자 노출 진입점(Controller 매핑)에 닿으면    최소 MID 로 올린다
+  3. SQL 실행 지점에 닿으면                          최소 MID 로 올린다
+  4. 둘 다 해당하면                                  HIGH
+
+2~4 는 점수만으로는 낮게 나올 수 있는 변경을 잡기 위한 것이다. 한 줄짜리
+조건 변경이라도 그것이 공개 API 이면서 DB 를 건드리면 중요도가 낮을 수 없다.
+
+**하지 못하는 것**: "주문 금액 계산은 매출에 직결된다" 같은 업무적 의미 판단.
+그것은 LLM(Agent)의 몫이고, 여기서는 구조적 파급도만 본다.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from codetest_mcp.db import NodeType
+from codetest_mcp.db import NodeType, RiskLevel
 from codetest_mcp.graph.impact import ImpactNodeInfo, ImpactReport
 
-#: 정의서 [UI] 4 의 3단계
-HIGH, MID, LOW = "HIGH", "MID", "LOW"
+#: 영향도 등급 → 기능 중요도 표기 (정의서 UI 4 는 High/Mid/Low 3단계)
+_RISK_TO_IMPORTANCE = {
+    RiskLevel.HIGH.value: "HIGH",
+    RiskLevel.MEDIUM.value: "MID",
+    RiskLevel.LOW.value: "LOW",
+}
 
-#: 점수 → 등급 임계값 (ImpactAnalyzer 의 risk 임계값과 같은 기준을 쓴다)
-_HIGH_THRESHOLD = 55
-_MID_THRESHOLD = 25
-
-#: 등급 비교용 순위 (승격 규칙이 등급을 내리지 않도록)
-_RANK = {LOW: 0, MID: 1, HIGH: 2}
+_ORDER = {"LOW": 0, "MID": 1, "HIGH": 2}
 
 
 @dataclass
 class ImportanceVerdict:
-    """기능 중요도와 그 판단 근거."""
+    """MCP 가 코드로 확정한 기능 중요도."""
 
-    level: str = LOW
+    #: HIGH / MID / LOW
+    importance: str = "LOW"
+    #: 판단 근거 (한 줄에 하나) — 그대로 화면에 뿌릴 수 있는 형태
+    rationale: str = ""
+    #: 근거가 된 그래프 영향도 점수 (0~100)
     score: int = 0
-    #: 이 등급이 나온 이유 (한 줄에 하나)
-    reasons: list[str] = field(default_factory=list)
-
-    @property
-    def rationale(self) -> str:
-        """UI 에 그대로 실을 수 있는 여러 줄 근거."""
-        return "\n".join(f"- {reason}" for reason in self.reasons)
-
-    def to_dict(self) -> dict:
-        return {
-            "importance": self.level,
-            "importance_score": self.score,
-            "importance_reasons": list(self.reasons),
-            "importance_rationale": self.rationale,
-        }
+    #: 등급을 올린 신호 (진입점 도달 / SQL 도달)
+    signals: list[str] = field(default_factory=list)
 
 
-def judge(report: ImpactReport, diff_ranges: dict[str, list[tuple[int, int]]]) -> ImportanceVerdict:
-    """영향도 분석 결과로 기능 중요도(High/Mid/Low)와 근거를 확정한다."""
-    score = report.score
-    level = _by_score(score)
-    reasons: list[str] = [
-        (
-            f"영향도 점수 {score}점 → {level} "
-            f"(기준: {_HIGH_THRESHOLD}점 이상 HIGH, {_MID_THRESHOLD}점 이상 MID)"
-        )
-    ]
-    reasons.extend(report.reasons)
-
-    nodes = report.all_nodes
-    endpoints = _entrypoints(nodes)
-    sql_nodes = [info for info in nodes if info.node_type == NodeType.SQL.value]
-
-    # --- 승격 규칙 ------------------------------------------------------
-    if endpoints and sql_nodes:
-        level, changed = _raise_to(level, HIGH)
-        if changed:
-            reasons.append(
-                f"승격: 사용자 노출 진입점 {len(endpoints)}개와 SQL 실행 지점 "
-                f"{len(sql_nodes)}개가 함께 걸려 HIGH 로 올림"
-            )
-    elif endpoints:
-        level, changed = _raise_to(level, MID)
-        if changed:
-            sample = ", ".join(_describe_entrypoint(info) for info in endpoints[:3])
-            reasons.append(f"승격: 사용자에게 노출되는 진입점에 영향({sample}) — 최소 MID")
-    elif sql_nodes:
-        level, changed = _raise_to(level, MID)
-        if changed:
-            reasons.append(
-                f"승격: SQL 실행 지점 {len(sql_nodes)}개에 영향 — 데이터 정합성 위험으로 최소 MID"
-            )
-
-    # --- 그래프가 비어 근거가 없을 때 ------------------------------------
-    if not nodes:
-        changed_files = len(diff_ranges)
-        reasons.append(
-            f"AST 그래프에서 변경 지점을 찾지 못해 변경 규모(파일 {changed_files}개)만으로 판단"
-            if changed_files
-            else "변경 내용이 없어 판단 근거가 없음"
-        )
-
-    return ImportanceVerdict(level=level, score=score, reasons=reasons)
-
-
-# ---------------------------------------------------------------------------
-def _by_score(score: int) -> str:
-    if score >= _HIGH_THRESHOLD:
-        return HIGH
-    if score >= _MID_THRESHOLD:
-        return MID
-    return LOW
-
-
-def _raise_to(current: str, target: str) -> tuple[str, bool]:
-    """등급을 target 이상으로 올린다. (새 등급, 실제로 올랐는지)"""
-    if _RANK[target] > _RANK[current]:
-        return target, True
-    return current, False
+def _at_least(current: str, floor: str) -> str:
+    return current if _ORDER[current] >= _ORDER[floor] else floor
 
 
 def _entrypoints(nodes: list[ImpactNodeInfo]) -> list[ImpactNodeInfo]:
+    """Controller 매핑처럼 사용자에게 노출된 진입점."""
     return [
-        info
-        for info in nodes
-        if info.node_type == NodeType.METHOD.value and (info.meta or {}).get("entrypoint")
+        node
+        for node in nodes
+        if node.node_type == NodeType.METHOD.value and (node.meta or {}).get("entrypoint")
     ]
 
 
-def _describe_entrypoint(info: ImpactNodeInfo) -> str:
-    meta = info.meta or {}
-    return f"{meta.get('http_method') or 'ENTRY'} {meta.get('route') or info.name}".strip()
+def _sql_nodes(nodes: list[ImpactNodeInfo]) -> list[ImpactNodeInfo]:
+    return [node for node in nodes if node.node_type == NodeType.SQL.value]
+
+
+def _route_of(node: ImpactNodeInfo) -> str:
+    meta = node.meta or {}
+    return f"{meta.get('http_method') or 'ENTRY'} {meta.get('route') or node.name}"
+
+
+def judge(report: ImpactReport, graph_ready: bool = True) -> ImportanceVerdict:
+    """영향도 계산 결과에서 기능 중요도를 정한다.
+
+    :param report:      ImpactAnalyzer 가 만든 변경/파급 노드와 점수
+    :param graph_ready: 개요 수집이 끝났는지. 아직이면 판단 근거가 비어 있으므로
+                        등급을 올리지 않고 그 사실을 근거에 적는다.
+    """
+    nodes = report.all_nodes
+    importance = _RISK_TO_IMPORTANCE.get(report.risk.value, "LOW")
+    signals: list[str] = []
+    lines = [f"영향도 점수 {report.score}/100 → 기본 등급 {importance}"]
+    lines += [f"{reason}" for reason in report.reasons]
+
+    if not graph_ready:
+        lines.append(
+            "프로젝트 개요 수집이 끝나지 않아 그래프 근거가 불완전합니다 — "
+            "등급을 올리지 않았습니다."
+        )
+        return ImportanceVerdict(importance, "\n".join(f"- {line}" for line in lines),
+                                 report.score, signals)
+
+    entrypoints = _entrypoints(nodes)
+    sql = _sql_nodes(nodes)
+
+    if entrypoints:
+        importance = _at_least(importance, "MID")
+        sample = ", ".join(_route_of(node) for node in entrypoints[:3])
+        signals.append("entrypoint")
+        lines.append(f"사용자 노출 진입점 {len(entrypoints)}개에 영향 ({sample}) → 최소 MID")
+
+    if sql:
+        importance = _at_least(importance, "MID")
+        tables: set[str] = set()
+        for node in sql:
+            tables.update((node.meta or {}).get("tables") or [])
+        suffix = f" / 대상 테이블: {', '.join(sorted(tables)[:5])}" if tables else ""
+        signals.append("sql")
+        lines.append(f"SQL 실행 지점 {len(sql)}개 연관{suffix} → 최소 MID")
+
+    if entrypoints and sql:
+        importance = "HIGH"
+        lines.append("공개 진입점과 DB 접근이 동시에 걸려 있음 → HIGH")
+
+    return ImportanceVerdict(
+        importance=importance,
+        rationale="\n".join(f"- {line}" for line in lines),
+        score=report.score,
+        signals=signals,
+    )

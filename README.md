@@ -40,22 +40,19 @@ CLI(codereview_gitver)  →  MCP(codetest-MCP)  →  Agent(codetest)
 
 > 프로젝트 개요 조회(`get_project_overview`)와 변경 단위 식별(`analyze_changes`)은
 > **도구로 노출하지 않는다.** CLI 가 직접 쓸 일이 없고, `test_generate` / `test_run` 이
-> 내부에서 만들어 Agent 프롬프트 입력으로 넘기는 중간 산출물이다. 개요 수집이 끝나지
-> 않았다면 `test_generate` 응답의 `analysis_warnings` 로 알려 준다.
+> 내부에서(`orchestrator.analyze`) 만들어 Agent 프롬프트 입력으로 넘기는 중간
+> 산출물이다. 개요 수집이 끝나지 않았다면 `test_generate` 응답의
+> `analysis_warnings` 로 알려 준다.
 
 ### `test_generate(project_id, diff, sources)`
 
 ```jsonc
 {
   // --- MCP 가 코드로 확정한 사실 ---
-  "importance": "MID", "importance_score": 30,
-  "importance_rationale": "- 영향도 점수 30점 → MID (기준: 55점 이상 HIGH, 25점 이상 MID)\n- …",
-  "importance_reasons": ["영향도 점수 30점 → MID …", "직접 변경된 그래프 노드 1개 …"],
-  "risk": "MEDIUM", "risk_score": 30,
-  "changed_units": [{"qualified_name": "com.example.demo.service.OrderService#calculateTotal(Order)",
-                     "node_type": "Method", "start_line": 6, "end_line": 12, "entrypoint": false}],
-  "affected_files": ["src/main/java/com/example/demo/service/OrderService.java"],
-  "base_package": "com.example.demo", "analysis_warnings": [],
+  "importance": "MID",
+  "importance_rationale": "- 영향도 점수 30점 → MID\n- 사용자 노출 진입점 1개에 영향 (GET /orders) → 최소 MID",
+  "base_package": "com.example.demo",
+  "graph_ready": true, "analysis_warnings": [],
 
   // --- Agent(LLM)가 돌려준 판단 ---
   "intent": "조건 변경", "intent_rationale": "- quantity > 10 …",
@@ -64,9 +61,9 @@ CLI(codereview_gitver)  →  MCP(codetest-MCP)  →  Agent(codetest)
 }
 ```
 
-기능 중요도는 `importance.py` 가 그래프 사실만으로 정한다 — 점수 임계값에 더해
+기능 중요도는 `importance.py` 가 그래프 사실만으로 정한다 — 영향도 등급에 더해
 사용자 노출 진입점·SQL 실행 지점이 걸리면 등급을 승격하고, **그 이유를 전부
-`importance_rationale` 에 남긴다.**
+`importance_rationale` 에 남긴다.** CLI 는 이 값을 결과 화면에 그대로 출력한다.
 
 ### `execute_tests(project_id, test_code, sources, base_package, diff, intent, intent_rationale)`
 
@@ -80,13 +77,12 @@ CLI(codereview_gitver)  →  MCP(codetest-MCP)  →  Agent(codetest)
 
 ```jsonc
 {
-  // --- 사실 ---
+  // --- MCP 가 확정한 사실 ---
   "result": "PASS", "exit_code": 0, "passed": 3, "failed": 0, "total": 3, "failures": [],
   "coverage": {"line_rate": 80.0, "branch_rate": 100.0, "line_covered": 16, "line_missed": 4},
   "jacoco_enabled": true, "springboot_applied": true,
   "applied": ["@SpringBootTest 주입 (class GeneratedOrderTest)", "import 보강: …"],
   "test_file_path": "src/test/java/com/example/demo/GeneratedOrderTest.java",
-  "command": ["sh", "./gradlew", "test", "--tests", "…", "jacocoTestReport"],
   "importance": "MID", "importance_rationale": "- 영향도 점수 30점 → MID …",
 
   // --- Agent(LLM) 판단 ---
@@ -97,8 +93,8 @@ CLI(codereview_gitver)  →  MCP(codetest-MCP)  →  Agent(codetest)
 
 ### `test_run(project_id, diff, sources)`
 
-`test_generate` → `execute_tests` 를 한 번에 수행하고 `{"generated": …, "report": …}` 로
-돌려준다. CLI `codetest run` 이 부르는 도구다.
+분석 → 생성 → 실행 → 판정을 한 번에 수행하고 `{"generated": …, "report": …}` 로
+돌려준다. CLI `codetest run` 이 부르는 도구다. 흐름 조립은 `orchestrator.py` 가 맡는다.
 
 ## 실행
 
