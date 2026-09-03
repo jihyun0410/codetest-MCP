@@ -177,17 +177,45 @@ def register_project(
 
     즉시 ingest_status=PENDING 으로 반환한다. 수집 완료 여부는
     test_generate 응답의 analysis_warnings 로 알린다 (PENDING → RUNNING → READY/FAILED).
+
+    **같은 이름·같은 git_url 로 다시 부르면 기존 프로젝트를 그대로 돌려준다.**
+    CLI 는 project_id 를 로컬 `.codetest/config.json` 에만 두는데, 이 파일은
+    .gitignore 대상이라 clone·PC 교체·정리 명령으로 쉽게 사라진다. 그때 재등록을
+    거부하면 CLI 가 project_id 를 되찾을 길이 없어
+    "등록된 프로젝트가 없습니다" → register → "이미 있습니다" 가 무한히 반복된다.
+    이 도구가 재조회 경로를 겸해야 그 고리가 끊긴다.
     """
     if not git_url.startswith(("http://", "https://", "git@")):
         raise ToolError("git_url 은 http(s):// 또는 git@ 형식이어야 합니다.")
 
+    normalized_url = git_url.rstrip("/")
+
     with session_scope() as db:
-        if db.scalar(select(Project).where(Project.name == name)):
-            raise ToolError(f"이미 같은 이름의 프로젝트가 있습니다: {name}")
+        existing = db.scalar(select(Project).where(Project.name == name))
+        if existing is not None:
+            # 이름이 같아도 저장소가 다르면 진짜 충돌이다. 조용히 넘기면 엉뚱한
+            # 저장소를 대상으로 테스트를 돌리게 되므로 그대로 막는다.
+            if existing.git_url != normalized_url:
+                raise ToolError(
+                    f"이미 같은 이름의 프로젝트가 있고 git_url 이 다릅니다: {name}\n"
+                    f"  등록된 주소: {existing.git_url}\n"
+                    f"  요청한 주소: {normalized_url}\n"
+                    "  다른 이름으로 등록하거나 기존 프로젝트를 삭제하세요."
+                )
+
+            # 같은 저장소면 재등록이 아니라 조회다 — CLI 가 project_id 를 되찾는다.
+            # 지난 수집이 실패한 채로 남아 있으면 여기서 다시 시작해 준다.
+            # (실패 상태 그대로 돌려주면 삭제 말고는 복구할 방법이 없다)
+            if existing.ingest_status == IngestStatus.FAILED.value:
+                logger.info("[%s] 지난 개요 수집이 실패해 다시 시작합니다", existing.name)
+                threading.Thread(target=run_ingest, args=(existing.id,), daemon=True).start()
+            else:
+                logger.info("[%s] 이미 등록된 프로젝트를 그대로 돌려줍니다", existing.name)
+            return _to_read(existing)
 
         project = Project(
             name=name,
-            git_url=git_url.rstrip("/"),
+            git_url=normalized_url,
             owner=owner,
             github_token=github_token,
             default_branch=default_branch,

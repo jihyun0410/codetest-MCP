@@ -32,7 +32,7 @@ CLI(codereview_gitver)  →  MCP(codetest-MCP)  →  Agent(codetest)
 | 도구 | 설명 |
 |---|---|
 | `hello` | 연결 확인용 에코 |
-| `register_project` | 프로젝트 등록 + 개요 수집(백그라운드) |
+| `register_project` | 프로젝트 등록 + 개요 수집(백그라운드). 같은 이름·같은 git_url 로 다시 부르면 기존 프로젝트를 그대로 돌려준다 |
 | `delete_project` | 프로젝트·그래프·작업 사본 삭제 |
 | `test_generate` | 변경 분석 + 중요도 판정 + Test Code 생성 (CLI `codetest generate`) |
 | `test_run` | 생성 + `@SpringBootTest` 실행 + 적절성 판정 (CLI `codetest run`) |
@@ -43,6 +43,13 @@ CLI(codereview_gitver)  →  MCP(codetest-MCP)  →  Agent(codetest)
 > 내부에서(`orchestrator.analyze`) 만들어 Agent 프롬프트 입력으로 넘기는 중간
 > 산출물이다. 개요 수집이 끝나지 않았다면 `test_generate` 응답의
 > `analysis_warnings` 로 알려 준다.
+
+> `register_project` 는 **멱등**하다. CLI 는 `project_id` 를 로컬
+> `.codetest/config.json` 에만 두는데 이 파일은 `.gitignore` 대상이라 clone·PC 교체로
+> 쉽게 사라진다. 그때 재등록을 거부하면 CLI 가 id 를 되찾을 길이 없어
+> "등록된 프로젝트가 없습니다" → register → "이미 있습니다" 가 무한 반복된다.
+> 그래서 같은 이름·같은 저장소면 기존 프로젝트를 돌려주고, 이름만 같고 저장소가
+> 다르면 그대로 거부한다. 지난 개요 수집이 FAILED 였다면 이때 다시 시작한다.
 
 ### `test_generate(project_id, diff, sources)`
 

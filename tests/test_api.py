@@ -207,11 +207,65 @@ async def test_register_project_hides_the_token(client):
     assert body["git_url"] == "https://github.com/acme/demo"   # 끝 슬래시 정규화
 
 
-async def test_duplicate_name_is_rejected(client):
+async def test_re_register_same_repo_returns_the_existing_project(client):
+    """CLI 가 project_id 를 잃었을 때 되찾는 유일한 경로다.
+
+    거부하면 "등록된 프로젝트가 없습니다" → register → "이미 있습니다" 가
+    무한히 반복된다 (.codetest/config.json 은 .gitignore 대상이라 쉽게 사라진다).
+    """
+    first = await _call(
+        client, "register_project",
+        name="demo", git_url="https://github.com/acme/demo", owner="kim",
+    )
+
+    again = await _call(
+        client, "register_project",
+        name="demo", git_url="https://github.com/acme/demo", owner="kim",
+    )
+
+    assert again["id"] == first["id"]          # 같은 project_id 를 되돌려준다
+
+
+async def test_re_register_normalizes_the_trailing_slash(client):
+    """끝 슬래시 차이는 같은 저장소로 본다 — 아니면 또 막힌다."""
+    first = await _call(
+        client, "register_project",
+        name="demo", git_url="https://github.com/acme/demo", owner="kim",
+    )
+    again = await _call(
+        client, "register_project",
+        name="demo", git_url="https://github.com/acme/demo/", owner="kim",
+    )
+    assert again["id"] == first["id"]
+
+
+async def test_same_name_different_repo_is_still_rejected(client):
+    """이름만 같고 저장소가 다르면 진짜 충돌이다 — 조용히 넘기면 안 된다."""
     await _register(client)
-    with pytest.raises(ToolError, match="같은 이름"):
+    with pytest.raises(ToolError, match="git_url 이 다릅니다"):
         await _call(client, "register_project",
                     name="demo", git_url="https://github.com/acme/other", owner="kim")
+
+
+async def test_re_register_restarts_a_failed_ingest(client, monkeypatch):
+    """수집이 실패한 채면 재등록이 다시 돌려준다 — 아니면 삭제 말고 복구법이 없다."""
+    from codetest_mcp.db import IngestStatus, Project, session_scope
+
+    project_id = await _register(client)
+    with session_scope() as db:
+        db.get(Project, project_id).ingest_status = IngestStatus.FAILED.value
+        db.commit()
+
+    restarted: list[str] = []
+    monkeypatch.setattr(main, "run_ingest", lambda pid: restarted.append(pid))
+
+    again = await _call(
+        client, "register_project",
+        name="demo", git_url="https://github.com/acme/demo", owner="kim",
+    )
+
+    assert again["id"] == project_id
+    assert restarted == [project_id]
 
 
 async def test_bad_git_url_is_rejected(client):
