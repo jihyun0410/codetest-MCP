@@ -1,8 +1,9 @@
 """MCP 서비스 설정 · 로깅 · API Key 인증.
 
 이 서비스는 **LLM 을 호출하지 않는다**. 정의서의
-"코드 기반으로 단순 처리 및 판단을 진행하는 부분은 MCP" 에 해당하는 작업만 수행하므로
-Anthropic 관련 설정이 존재하지 않는다.
+"코드 기반으로 단순 처리 및 판단을 진행하는 부분은 MCP" 에 해당하는 작업만 수행한다.
+LLM 판단이 필요한 부분은 Agent(FastAPI)에 넘기므로 LLM 모델/키 설정은 여기 없고,
+**Agent 주소와 인증 키**만 있다 (CODETEST_MCP_AGENT_*).
 
 비밀값(API Key, GitHub Token)은 코드에 두지 않고 .env / OS 환경변수로만 주입한다.
 """
@@ -36,6 +37,14 @@ class Settings(BaseSettings):
     api_keys: Annotated[list[str], NoDecode] = Field(
         default_factory=list, alias="CODETEST_MCP_API_KEYS"
     )
+
+    # --- Agent (LLM 판단 전담) — 흐름: CLI → MCP → Agent ---
+    #: Agent FastAPI 주소. MCP 가 의도 파악/Test Code 생성/적절성 판단을 여기로 넘긴다.
+    agent_url: str = Field(default="http://localhost:8000", alias="CODETEST_MCP_AGENT_URL")
+    #: Agent 가 X-API-Key 헤더로 요구하는 값 (Agent 의 CODETEST_API_KEYS 중 하나)
+    agent_api_key: str = Field(default="", alias="CODETEST_MCP_AGENT_API_KEY")
+    #: LLM 생성은 수 분이 걸릴 수 있다
+    agent_timeout_seconds: int = Field(default=600, alias="CODETEST_MCP_AGENT_TIMEOUT")
 
     database_url: str = Field(
         default="sqlite:///./data/codetest_mcp.db", alias="CODETEST_MCP_DATABASE_URL"

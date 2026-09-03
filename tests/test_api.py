@@ -1,6 +1,7 @@
-"""MCP 도구 계약 검증 (Agent 가 호출하는 형태 그대로, in-memory 클라이언트).
+"""MCP 도구 계약 검증 (CLI 가 호출하는 형태 그대로, in-memory 클라이언트).
 
-MCP 는 LLM 을 쓰지 않으므로 스텁이 필요 없다. Git clone / Gradle 만 대체한다.
+MCP 는 LLM 을 직접 쓰지 않는다. LLM 판단은 Agent(FastAPI)로 넘기므로
+Git clone / Gradle 과 함께 **Agent 호출**을 스텁으로 대체한다.
 """
 
 from __future__ import annotations
@@ -53,6 +54,49 @@ diff --git a/src/main/java/com/example/demo/service/OrderService.java b/src/main
 """
 
 
+GENERATED_TEST = """\
+package com.example.demo;
+
+class GeneratedOrderTest {
+    @Test
+    void t() {}
+}
+"""
+
+
+def _stub_generate(**kwargs) -> dict:
+    """Agent `/api/v1/tests/generate` 대역 — 받은 분석을 그대로 되비춘다."""
+    _stub_generate.calls.append(kwargs)
+    return {
+        "thinking": "수량 10 초과 분기가 새로 생겼다",
+        "intent": "조건 변경",
+        "intent_rationale": "- quantity > 10 조건이 추가됨",
+        "test_cases": "- [정상] 10개 이하\n- [실패] 11개",
+        "test_code": GENERATED_TEST,
+        "rationale": "- 경계값을 검증한다",
+        "target_code": "### OrderService.java",
+        "base_package": kwargs.get("analysis", {}).get("base_package"),
+    }
+
+
+_stub_generate.calls = []
+
+
+def _stub_report(**kwargs) -> dict:
+    """Agent `/api/v1/tests/execute` 대역 — 적절성 판정만 돌려준다."""
+    _stub_report.calls.append(kwargs)
+    return {
+        "verdict": "적절",
+        "verdict_rationale": "- 경계값이 모두 검증됨",
+        "details": "- 3건 성공",
+        "intent": kwargs.get("intent", ""),
+        "intent_rationale": kwargs.get("intent_rationale", ""),
+    }
+
+
+_stub_report.calls = []
+
+
 @pytest.fixture
 async def client(monkeypatch, tmp_path):
     engine = create_engine(
@@ -67,6 +111,9 @@ async def client(monkeypatch, tmp_path):
     # clone 은 네트워크가 필요하므로 등록 테스트에서는 수집을 건너뛴다.
     monkeypatch.setattr(main, "run_ingest", lambda project_id: None)
     monkeypatch.setattr(settings, "api_keys", [])
+    # Agent 는 별도 프로세스다. LLM 판단만 대신 돌려주는 스텁으로 바꾼다.
+    monkeypatch.setattr(main.agent_client, "generate", _stub_generate)
+    monkeypatch.setattr(main.agent_client, "report", _stub_report)
 
     async with Client(mcp) as c:
         yield c
@@ -89,9 +136,16 @@ async def _register(client, name="demo") -> str:
 async def test_exposes_the_code_based_tools(client):
     names = {t.name for t in await client.list_tools()}
     assert names == {
-        "hello", "register_project", "delete_project", "get_project_overview",
-        "analyze_changes", "execute_tests",
+        "hello", "register_project", "delete_project",
+        "test_generate", "test_run", "execute_tests",
     }
+
+
+async def test_removed_tools_are_not_exposed(client):
+    """get_project_overview / analyze_changes 는 도구로 노출하지 않는다."""
+    names = {t.name for t in await client.list_tools()}
+    assert "get_project_overview" not in names
+    assert "analyze_changes" not in names
 
 
 async def test_hello_echoes(client):
@@ -125,15 +179,6 @@ async def test_bad_git_url_is_rejected(client):
                     name="x", git_url="ftp://nope", owner="kim")
 
 
-async def test_overview_reports_stored_summary(client):
-    project_id = await _register(client)
-    body = await _call(client, "get_project_overview", project_id=project_id)
-
-    assert body["project_id"] == project_id
-    assert body["ingest_status"] == "PENDING"
-    assert body["node_counts"] == {}
-
-
 async def test_delete_project(client, monkeypatch):
     monkeypatch.setattr(main.RepoService, "remove", lambda self: None)
     project_id = await _register(client)
@@ -143,35 +188,67 @@ async def test_delete_project(client, monkeypatch):
         await _call(client, "delete_project", project_id=project_id)
 
 
-# --- 변경 단위 식별 (정의서 (2)) ----------------------------------------------
-async def test_analyze_changes_parses_diff_ranges(client):
+# --- Test Code 생성 (정의서 (1) generate, (2), (3)) ---------------------------
+async def test_generate_analyzes_then_asks_the_agent(client):
+    _stub_generate.calls.clear()
     project_id = await _register(client)
-    body = await _call(client, "analyze_changes", project_id=project_id, diff=DIFF)
+    body = await _call(client, "test_generate", project_id=project_id, diff=DIFF,
+                       sources=[{"path": "src/main/java/com/example/demo/service/OrderService.java",
+                                 "content": ORDER_SERVICE}])
 
+    # MCP 가 Diff 를 코드 기반으로 분석해 Agent 에게 넘겼다
+    analysis = _stub_generate.calls[-1]["analysis"]
     path = "src/main/java/com/example/demo/service/OrderService.java"
-    assert path in body["changed_ranges"]
-    assert body["risk"] in {"LOW", "MEDIUM", "HIGH"}
-    assert body["risk_reasons"]
+    assert path in analysis["changed_ranges"]
+    assert analysis["risk"] in {"LOW", "MEDIUM", "HIGH"}
+    assert analysis["diff"] == DIFF          # 원본 Diff 도 함께 넘어간다
+
+    # Agent 의 LLM 판단이 응답에 실렸다
+    assert body["intent"] == "조건 변경"
+    assert "@SpringBootTest" not in body["test_code"]   # 주입은 실행 단계의 일
+    assert body["test_code"].strip()
 
 
-async def test_analyze_warns_when_overview_not_ready(client):
+async def test_generate_reports_importance_with_its_rationale(client):
+    """[UI] 4 기능 중요도 + 그렇게 판단한 근거를 함께 돌려준다."""
+    project_id = await _register(client)
+    body = await _call(client, "test_generate", project_id=project_id, diff=DIFF)
+
+    assert body["importance"] in {"HIGH", "MID", "LOW"}
+    assert body["importance_reasons"]
+    # 근거 첫 줄은 등급이 나온 계산 기준을 밝힌다
+    assert str(body["importance_score"]) in body["importance_rationale"]
+    assert body["importance"] in body["importance_rationale"]
+
+
+async def test_generate_warns_when_overview_not_ready(client):
     project_id = await _register(client)     # ingest 는 스텁이라 PENDING 상태
-    body = await _call(client, "analyze_changes", project_id=project_id, diff=DIFF)
+    body = await _call(client, "test_generate", project_id=project_id, diff=DIFF)
 
-    assert body["graph_ready"] is False
-    assert any("개요 수집" in w for w in body["warnings"])
+    assert any("개요 수집" in w for w in body["analysis_warnings"])
 
 
-async def test_analyze_unknown_project_is_rejected(client):
+async def test_generate_unknown_project_is_rejected(client):
     with pytest.raises(ToolError, match="찾을 수 없습니다"):
-        await _call(client, "analyze_changes", project_id="nope", diff="")
+        await _call(client, "test_generate", project_id="nope", diff="")
+
+
+async def test_generate_surfaces_agent_failure(client, monkeypatch):
+    from codetest_mcp.agent_client import AgentError
+
+    project_id = await _register(client)
+
+    def _boom(**kwargs):
+        raise AgentError("Agent 에 연결할 수 없습니다: http://localhost:8000")
+
+    monkeypatch.setattr(main.agent_client, "generate", _boom)
+    with pytest.raises(ToolError, match="Agent"):
+        await _call(client, "test_generate", project_id=project_id, diff=DIFF)
 
 
 # --- 테스트 실행 (정의서 (1), [상세] 4) ----------------------------------------
-async def test_execute_injects_springboot_and_reports_facts(client, monkeypatch):
-    project_id = await _register(client)
-    captured: dict = {}
-
+def _stub_gradle(monkeypatch, captured: dict, *, failed: int = 0, exit_code: int = 0):
+    """clone 과 gradle 을 대체하고, 실제로 실행된 소스를 captured 에 남긴다."""
     monkeypatch.setattr(
         main.RepoService, "ensure_clone", lambda self, branch=None: pathlib.Path("/tmp/x")
     )
@@ -181,8 +258,8 @@ async def test_execute_injects_springboot_and_reports_facts(client, monkeypatch)
         captured["file_path"] = prepared.file_path
         captured["overlay"] = overlay_sources
         return ExecutionResult(
-            exit_code=0, output="BUILD SUCCESSFUL",
-            passed=3, failed=0, skipped=0, total=3,
+            exit_code=exit_code, output="BUILD SUCCESSFUL",
+            passed=3, failed=failed, skipped=0, total=3 + failed,
             coverage={"line_rate": 92.0, "line_covered": 23, "line_missed": 2,
                       "branch_rate": 75.0, "branch_covered": 3, "branch_missed": 1},
             jacoco_enabled=True,
@@ -193,6 +270,12 @@ async def test_execute_injects_springboot_and_reports_facts(client, monkeypatch)
         )
 
     monkeypatch.setattr(main, "run_tests", _fake_run)
+
+
+async def test_execute_injects_springboot_and_reports_facts(client, monkeypatch):
+    project_id = await _register(client)
+    captured: dict = {}
+    _stub_gradle(monkeypatch, captured)
 
     body = await _call(
         client, "execute_tests",
@@ -212,6 +295,66 @@ async def test_execute_injects_springboot_and_reports_facts(client, monkeypatch)
     assert body["coverage"]["line_rate"] == 92.0
     assert body["jacoco_enabled"] is True
     assert body["passed"] == 3
+    # PASS/FAIL 은 집계로 확정하고, 적절성 판정만 Agent 가 채운다
+    assert body["result"] == "PASS"
+    assert body["verdict"] == "적절"
+    assert body["verdict_rationale"]
+    # [UI] 4 중요도와 근거는 실행 리포트에도 실린다
+    assert body["importance"] in {"HIGH", "MID", "LOW"}
+    assert body["importance_rationale"]
+
+
+async def test_execute_marks_failure_and_keeps_the_intent(client, monkeypatch):
+    project_id = await _register(client)
+    _stub_gradle(monkeypatch, {}, failed=2, exit_code=1)
+
+    body = await _call(
+        client, "execute_tests",
+        project_id=project_id,
+        test_code="package com.example.demo;\n\nclass FooTest {}\n",
+        diff=DIFF,
+        intent="조건 변경",
+        intent_rationale="- quantity > 10 조건이 추가됨",
+    )
+
+    assert body["result"] == "FAIL"
+    # 정의서 (2): 파악한 의도와 근거를 결과값에 넣는다
+    assert body["intent"] == "조건 변경"
+    assert body["intent_rationale"]
+
+
+# --- 생성 + 실행 (정의서 (1) run) ------------------------------------------------
+async def test_run_generates_then_executes(client, monkeypatch):
+    project_id = await _register(client)
+    captured: dict = {}
+    _stub_gradle(monkeypatch, captured)
+
+    body = await _call(
+        client, "test_run",
+        project_id=project_id, diff=DIFF,
+        sources=[{"path": "src/main/java/com/example/demo/service/OrderService.java",
+                  "content": ORDER_SERVICE}],
+    )
+
+    generated, report = body["generated"], body["report"]
+    # Agent 가 만든 코드가 그대로 실행 단계로 넘어가 @SpringBootTest 가 주입됐다
+    assert "GeneratedOrderTest" in generated["test_code"]
+    assert "@SpringBootTest" in captured["source"]
+    assert report["result"] == "PASS"
+    # 생성 결과와 리포트 양쪽에서 중요도와 근거를 볼 수 있다
+    assert generated["importance"] == report["importance"]
+    assert generated["importance_rationale"]
+    assert report["importance_rationale"]
+    # 생성 때 파악한 의도가 판정 단계로 이어진다
+    assert report["intent"] == generated["intent"]
+
+
+async def test_run_rejects_empty_test_code(client, monkeypatch):
+    project_id = await _register(client)
+    monkeypatch.setattr(main.agent_client, "generate", lambda **kw: {"test_code": ""})
+
+    with pytest.raises(ToolError, match="생성하지 못했습니다"):
+        await _call(client, "test_run", project_id=project_id, diff=DIFF)
 
 
 async def test_execute_rejects_unparseable_test_code(client, monkeypatch):
