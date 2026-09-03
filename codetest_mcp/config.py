@@ -37,6 +37,20 @@ class Settings(BaseSettings):
         default_factory=list, alias="CODETEST_MCP_API_KEYS"
     )
 
+    # --- Agent (LLM 판단 위임 대상) ---
+    #: 정의서: "Fast API를 통해 송/수신하는 방식으로 구현"
+    agent_base_url: str = Field(
+        default="http://localhost:8000", alias="CODETEST_MCP_AGENT_BASE_URL"
+    )
+    agent_api_key: str = Field(default="", alias="CODETEST_MCP_AGENT_API_KEY")
+    agent_timeout_seconds: float = Field(
+        default=60.0, alias="CODETEST_MCP_AGENT_TIMEOUT"
+    )
+    #: LLM 생성/판정은 오래 걸린다
+    agent_generate_timeout_seconds: float = Field(
+        default=600.0, alias="CODETEST_MCP_AGENT_GENERATE_TIMEOUT"
+    )
+
     database_url: str = Field(
         default="sqlite:///./data/codetest_mcp.db", alias="CODETEST_MCP_DATABASE_URL"
     )

@@ -2,9 +2,12 @@
 
 정의서:
   "LLM을 사용하여 판단하는 부분은 Agent, **코드 기반으로 단순 처리 및 판단을
-   진행하는 부분은 MCP** 로 구분"
+   진행하는 부분은 MCP** 로 구분하여 Fast API를 통해 송/수신하는 방식으로 구현"
 
-이 서버는 LLM 을 호출하지 않는다. Agent 가 MCP 클라이언트로 붙어 도구를 호출한다.
+CLI 가 MCP 클라이언트로 붙어 도구를 호출한다. MCP 는 코드 기반 사실을 확정하고,
+LLM 판단이 필요한 부분만 Agent(codetest)에 FastAPI 로 넘긴 뒤 결과를 합쳐 돌려준다.
+
+    IntelliJ Terminal → CLI → MCP(이 서버) → Agent(LLM) → MCP → CLI
 
     python -m codetest_mcp     # 패키지라 -m 으로 띄운다 (main.py 직접 실행은 import 실패)
     → streamable-http, 0.0.0.0:80 (CODETEST_MCP_TRANSPORT / _HOST / _PORT 로 변경)
@@ -14,8 +17,13 @@
   register_project      프로젝트 등록 + Git clone + AST → 개요 DB 저장   (상세 1)
   delete_project        등록 정보/그래프/작업 사본 삭제
   get_project_overview  저장된 프로젝트 개요 조회                        (상세 1)
-  analyze_changes       Git Diff + AST 로 변경 코드 단위·영향도 식별      (2)
-  execute_tests         @SpringBootTest 주입 + JaCoCo 실행               (1), (상세 4)
+  analyze_changes       Git Diff + AST 변경 단위·영향도·중요도 식별      (2), [UI] 4
+  test_generate         codetest generate — 분석 → Agent 생성
+  test_run              codetest run      — 분석 → 생성 → 실행 → 판정
+  execute_tests         codetest test     — 실행 → 판정                 (1), (상세 4)
+
+기능 중요도(High/Mid/Low)는 Agent 에 묻지 않는다. 코드 그래프로 확정하는 값이라
+MCP 가 정한다 (`importance.py`).
 """
 
 from __future__ import annotations
@@ -32,30 +40,22 @@ from fastmcp.server.dependencies import get_http_headers
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from pydantic import Field
 from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from codetest_mcp import springboot
+from codetest_mcp import orchestrator
+from codetest_mcp.agent_client import AgentError, agent_client
 from codetest_mcp.config import get_logger, settings, setup_logging, verify_api_key
-from codetest_mcp.db import (
-    GraphNode,
-    IngestStatus,
-    NodeType,
-    Project,
-    init_db,
-    session_scope,
-)
-from codetest_mcp.executor import ExecutionError, run_tests
+from codetest_mcp.db import IngestStatus, Project, init_db, session_scope
 from codetest_mcp.graph.builder import GraphBuilder
-from codetest_mcp.graph.impact import ImpactAnalyzer, parse_diff_ranges
 from codetest_mcp.graph.store import GraphStore
+from codetest_mcp.orchestrator import FlowError, base_package, project_or_fail
 from codetest_mcp.repo import RepoService
 from codetest_mcp.schemas import (
     ChangeAnalysisResponse,
-    ChangedUnit,
-    ExecuteResponse,
-    ImpactedUnit,
+    GeneratedResult,
     OverviewResponse,
     ProjectRead,
+    ReportResult,
+    RunResult,
     SourceFilePayload,
 )
 
@@ -64,30 +64,18 @@ logger = get_logger(__name__)
 
 
 # --- 헬퍼 --------------------------------------------------------------------
-def _project(db: Session, project_id: str) -> Project:
-    project = db.get(Project, project_id)
-    if project is None:
-        raise ToolError(f"프로젝트를 찾을 수 없습니다: {project_id}")
-    return project
-
-
 def _to_read(project: Project) -> ProjectRead:
     payload = ProjectRead.model_validate(project)
     payload.has_github_token = bool(project.github_token)
     return payload
 
 
-def _base_package(db: Session, project_id: str) -> str | None:
-    """저장된 그래프의 파일 경로에서 기준 패키지를 추론한다."""
-    paths = list(
-        db.scalars(
-            select(GraphNode.file_path).where(
-                GraphNode.project_id == project_id,
-                GraphNode.node_type == NodeType.FILE.value,
-            )
-        )
-    )
-    return springboot.detect_base_package(paths)
+def _flow(call, *args, **kwargs):
+    """FlowError 를 ToolError 로 옮긴다 — CLI 화면에 이유가 그대로 뜬다."""
+    try:
+        return call(*args, **kwargs)
+    except FlowError as exc:
+        raise ToolError(str(exc)) from None
 
 
 # --- 백그라운드 수집 ---------------------------------------------------------
@@ -126,7 +114,7 @@ def run_ingest(project_id: str) -> None:
 class ApiKeyMiddleware(Middleware):
     """HTTP 전송일 때만 X-API-Key 를 검사한다.
 
-    stdio 는 Agent 가 이 서버를 자식 프로세스로 띄운 것이라 신뢰 경계가 아니다
+    stdio 는 CLI 가 이 서버를 자식 프로세스로 띄운 것이라 신뢰 경계가 아니다
     (헤더 자체가 없다). CODETEST_MCP_API_KEYS 가 비어 있으면 인증 비활성화.
     """
 
@@ -143,7 +131,10 @@ async def lifespan(server: FastMCP) -> AsyncIterator[None]:
     """기동 시 런타임 디렉터리 생성 + 테이블 초기화."""
     settings.ensure_directories()
     init_db()
-    logger.info("%s 기동 (transport=%s)", settings.app_name, settings.transport)
+    logger.info(
+        "%s 기동 (transport=%s, agent=%s)",
+        settings.app_name, settings.transport, settings.agent_base_url,
+    )
     yield
     logger.info("%s 종료", settings.app_name)
 
@@ -152,10 +143,10 @@ mcp = FastMCP(
     name=settings.app_name,
     version="0.1.0",
     instructions=(
-        "코드 기반 처리 전담 MCP. Git Diff/AST 변경 단위 식별, 프로젝트 개요 저장, "
-        "@SpringBootTest 주입, JaCoCo 실행을 담당하며 LLM 을 호출하지 않는다. "
-        "모든 응답은 코드로 확정한 사실만 담으므로 변경 의도 해석·중요도 판정·"
-        "테스트 코드 작성·결과 적절성 판단은 호출하는 쪽(Agent)이 수행한다."
+        "CLI 명령의 진입점. Git Diff/AST 변경 단위 식별, 프로젝트 개요 저장, "
+        "기능 중요도 판단, @SpringBootTest 주입, JaCoCo 실행을 코드 기반으로 수행하고, "
+        "변경 의도 해석·테스트 코드 작성·결과 적절성 판단처럼 LLM 이 필요한 부분만 "
+        "Agent 에 FastAPI 로 위임한다."
     ),
     lifespan=lifespan,
     middleware=[ApiKeyMiddleware()],
@@ -165,8 +156,13 @@ mcp = FastMCP(
 # --- 연결 확인 ----------------------------------------------------------------
 @mcp.tool()
 def hello(name: str) -> str:
-    """연결 확인용 에코. 이름을 그대로 돌려준다."""
-    return f"Hello! Test Code MCP ! {name}"
+    """연결 확인용 에코. Agent 연결 상태도 함께 알린다."""
+    try:
+        agent_client.health()
+        agent = "ok"
+    except AgentError as exc:
+        agent = f"unreachable: {exc}"
+    return f"Hello! Test Code MCP ! {name} (agent: {agent})"
 
 
 # --- 프로젝트 개요 (정의서 상세 1) --------------------------------------------
@@ -210,7 +206,7 @@ def register_project(
 def delete_project(project_id: str) -> dict:
     """프로젝트와 그래프를 함께 삭제하고 작업 사본(clone)도 제거한다."""
     with session_scope() as db:
-        project = _project(db, project_id)
+        project = _flow(project_or_fail, db, project_id)
         repo = RepoService(project.id, project.git_url, project.github_token)
         db.delete(project)
         db.commit()
@@ -221,12 +217,12 @@ def delete_project(project_id: str) -> dict:
 
 @mcp.tool()
 def get_project_overview(project_id: str) -> OverviewResponse:
-    """DB 에 저장된 프로젝트 개요를 돌려준다 (Agent 프롬프트 컨텍스트).
+    """DB 에 저장된 프로젝트 개요를 돌려준다.
 
     프레임워크, 언어 비중, 그래프 노드/간선 수, @SpringBootApplication 기준 패키지.
     """
     with session_scope() as db:
-        project = _project(db, project_id)
+        project = _flow(project_or_fail, db, project_id)
         store = GraphStore(db, project.id)
         return OverviewResponse(
             project_id=project.id,
@@ -237,143 +233,93 @@ def get_project_overview(project_id: str) -> OverviewResponse:
             language_stats=project.language_stats or {},
             node_counts=store.counts_by_type(),
             edge_counts=store.edge_counts_by_type(),
-            base_package=_base_package(db, project.id),
+            base_package=base_package(db, project.id),
             last_indexed_at=project.last_indexed_at,
         )
 
 
-# --- 변경 코드 식별 (정의서 (2)) ----------------------------------------------
+# --- 변경 코드 식별 + 기능 중요도 (정의서 (2), [UI] 4) --------------------------
 @mcp.tool()
 def analyze_changes(
     project_id: str,
     diff: Annotated[str, Field(description="변경분 unified diff")] = "",
+    sources: Annotated[
+        list[SourceFilePayload],
+        Field(description="미커밋 변경 파일 본문 (Diff 에 hunk 가 없는 파일의 구간용)"),
+    ] = [],  # noqa: B006 — 읽기 전용. pydantic 이 호출마다 복사한다
 ) -> ChangeAnalysisResponse:
-    """Git Diff 와 AST 분석 기반으로 실제 변경된 코드 단위·영향도를 식별한다.
+    """Git Diff 와 AST 로 변경된 코드 단위·영향도·기능 중요도를 식별한다.
 
-    확정 가능한 사실만 반환한다. 의도(기능 추가/조건 변경/성능 개선) 해석은
-    LLM 의 일이므로 이 결과를 받아 호출하는 쪽에서 수행한다.
+    LLM 을 쓰지 않는다. 의도(기능 추가/조건 변경/성능 개선) 해석만 Agent 의 몫이다.
     """
-    with session_scope() as db:
-        project = _project(db, project_id)
-
-        analyzer = ImpactAnalyzer(GraphStore(db, project.id))
-        ranges = parse_diff_ranges(diff)
-        report = analyzer.analyze(ranges)
-
-        graph_ready = project.ingest_status == IngestStatus.READY.value
-        warnings: list[str] = []
-        if not graph_ready:
-            warnings.append(
-                f"프로젝트 개요 수집이 완료되지 않았습니다 (상태: {project.ingest_status}). "
-                "AST 기반 변경 단위 식별 결과가 비어 있을 수 있습니다."
-            )
-        if ranges and not report.changed:
-            warnings.append("Diff 라인과 겹치는 그래프 노드를 찾지 못했습니다.")
-
-        return ChangeAnalysisResponse(
-            project_id=project.id,
-            changed_ranges=ranges,
-            changed_units=[
-                ChangedUnit(
-                    qualified_name=info.qualified_name,
-                    name=info.name,
-                    node_type=info.node_type,
-                    file_path=info.file_path,
-                    language=(info.meta or {}).get("language"),
-                    signature=info.signature,
-                    start_line=info.start_line,
-                    end_line=info.end_line,
-                    entrypoint=bool((info.meta or {}).get("entrypoint")),
-                    http_method=(info.meta or {}).get("http_method"),
-                    route=(info.meta or {}).get("route"),
-                )
-                for info in report.changed
-            ],
-            impacted_units=[
-                ImpactedUnit(
-                    qualified_name=info.qualified_name,
-                    node_type=info.node_type,
-                    file_path=info.file_path,
-                    depth=info.depth,
-                    via=info.via,
-                )
-                for info in report.impacted
-            ],
-            affected_files=report.affected_files,
-            risk=report.risk.value,
-            risk_score=report.score,
-            risk_reasons=report.reasons,
-            frameworks=project.frameworks or [],
-            base_package=_base_package(db, project.id),
-            graph_ready=graph_ready,
-            warnings=warnings,
-        )
+    return _flow(orchestrator.analyze, project_id, diff, sources)
 
 
-# --- 테스트 실행 (정의서 (1), 상세 4) ------------------------------------------
+# --- CLI 명령 흐름 -------------------------------------------------------------
+@mcp.tool()
+def test_generate(
+    project_id: str,
+    diff: Annotated[str, Field(description="변경분 unified diff")] = "",
+    sources: Annotated[
+        list[SourceFilePayload], Field(description="변경 파일 본문 (테스트 대상 코드)")
+    ] = [],  # noqa: B006
+) -> GeneratedResult:
+    """`codetest generate` — 변경 의도를 파악하고 @SpringBootTest 를 생성한다.
+
+    MCP 가 변경 단위·영향도·중요도를 확정한 뒤 Agent 에 생성을 맡긴다. 실행은 하지 않는다.
+    """
+    return _flow(orchestrator.test_generate, project_id, diff, sources)
+
+
+@mcp.tool()
+def test_run(
+    project_id: str,
+    diff: Annotated[str, Field(description="변경분 unified diff")] = "",
+    sources: Annotated[
+        list[SourceFilePayload], Field(description="변경 파일 본문 (테스트 대상 코드)")
+    ] = [],  # noqa: B006
+) -> RunResult:
+    """`codetest run` — 분석 → 생성 → 실행 → 판정을 한 번에 (정의서 흐름 3~5).
+
+    Gradle 빌드와 Spring 컨텍스트 기동이 포함되어 수 분이 걸릴 수 있다.
+    """
+    return _flow(orchestrator.test_run, project_id, diff, sources)
+
+
+# --- 테스트 실행 + 판정 (정의서 (1), 상세 4) ------------------------------------
 @mcp.tool()
 def execute_tests(
     project_id: str,
-    test_code: Annotated[str, Field(description="생성된 Java 테스트 소스")],
+    test_code: Annotated[str, Field(description="실행할 Java 테스트 소스")],
     sources: Annotated[
         list[SourceFilePayload],
         Field(description="실행 전에 작업 사본에 덮어쓸 변경 파일 (미커밋 변경분)"),
-    ] = [],  # noqa: B006 — 읽기 전용. pydantic 이 호출마다 복사한다
+    ] = [],  # noqa: B006
     base_package: Annotated[
         str | None,
         Field(description="package 선언이 없을 때 쓸 기준 패키지. 생략하면 개요에서 찾는다"),
     ] = None,
-) -> ExecuteResponse:
-    """생성된 Test Code 를 @SpringBootTest 에 넣고 JaCoCo 와 함께 실행한다.
+    diff: Annotated[
+        str, Field(description="변경분 unified diff — 기능 중요도를 다시 판단하는 데 쓴다")
+    ] = "",
+    intent: Annotated[str, Field(description="이전에 파악한 변경 의도")] = "",
+    intent_rationale: Annotated[str, Field(description="그 의도의 근거")] = "",
+) -> ReportResult:
+    """`codetest test` — Test Code 를 @SpringBootTest 로 실행하고 적절성을 판정한다.
 
     @SpringBootTest 가 없으면 주입하고 import/package 선언도 보강한 뒤
     src/test/java/<package>/<Class>.java 로 저장해 gradle test 를 돌린다.
-    실행 사실만 반환한다 — 결과 적절성 판정은 호출하는 쪽의 몫이다.
+    실행 사실은 MCP 가, 적절성 판단은 Agent(LLM)가 만든다.
     """
-    with session_scope() as db:
-        project = _project(db, project_id)
-        pkg = base_package or _base_package(db, project.id)
-        repo = RepoService(project.id, project.git_url, project.github_token)
-        branch = project.default_branch
-
-    try:
-        prepared = springboot.prepare(test_code, pkg)
-    except ValueError as exc:
-        raise ToolError(str(exc)) from None
-
-    try:
-        repo.ensure_clone(branch)
-        result = run_tests(
-            repo.path,
-            prepared,
-            overlay_sources=[(item.path, item.content) for item in sources],
-        )
-    except ExecutionError as exc:
-        raise ToolError(str(exc)) from None
-    except Exception as exc:
-        raise ToolError(f"테스트 실행 실패: {exc}") from None
-
-    return ExecuteResponse(
-        project_id=project_id,
-        exit_code=result.exit_code,
-        output=result.output,
-        passed=result.passed,
-        failed=result.failed,
-        skipped=result.skipped,
-        total=result.total,
-        failures=result.failures,
-        coverage=result.coverage,
-        jacoco_enabled=result.jacoco_enabled,
-        springboot_applied=result.springboot_applied,
-        applied=result.applied,
-        test_file_path=result.test_file_path,
-        command=result.command,
+    return _flow(
+        orchestrator.execute_tests,
+        project_id, test_code, sources, base_package, diff, intent, intent_rationale,
     )
 
 
 # --- 실행 --------------------------------------------------------------------
 def main() -> None:
-    """`python -m codetest_mcp` / `python codetest_mcp/main.py` 공통 진입점."""
+    """`python -m codetest_mcp` 진입점."""
     if settings.transport == "stdio":
         mcp.run(transport="stdio")
     else:
