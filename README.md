@@ -32,7 +32,7 @@ CLI(codereview_gitver)  →  MCP(codetest-MCP)  →  Agent(codetest)
 | 도구 | 설명 |
 |---|---|
 | `hello` | 연결 확인용 에코 |
-| `register_project` | 프로젝트 등록 + 개요 수집(백그라운드). 같은 이름·같은 git_url 로 다시 부르면 기존 프로젝트를 그대로 돌려준다 |
+| `register_project` | 프로젝트 등록 + **커밋 소스 스냅샷 저장** + 개요 수집(백그라운드). 같은 이름·같은 git_url 로 다시 부르면 기존 프로젝트를 그대로 돌려주고 스냅샷을 갱신한다 |
 | `delete_project` | 프로젝트·그래프·작업 사본 삭제 |
 | `test_generate` | 변경 분석 + 중요도 판정 + Test Code 생성 (CLI `codetest generate`) |
 | `test_run` | 생성 + `@SpringBootTest` 실행 + 적절성 판정 (CLI `codetest run`) |
@@ -50,6 +50,28 @@ CLI(codereview_gitver)  →  MCP(codetest-MCP)  →  Agent(codetest)
 > "등록된 프로젝트가 없습니다" → register → "이미 있습니다" 가 무한 반복된다.
 > 그래서 같은 이름·같은 저장소면 기존 프로젝트를 돌려주고, 이름만 같고 저장소가
 > 다르면 그대로 거부한다. 지난 개요 수집이 FAILED 였다면 이때 다시 시작한다.
+
+## 커밋 소스 스냅샷 — Agent 가 "현재 코드" 를 보게 하는 장치
+
+CLI 의 `generate`/`run`/`test` 는 `git diff HEAD` 기준이라 **미커밋 변경분만** 보낸다.
+그것만 Agent 에 넘기면 LLM 이 변경 지점이 호출하는 커밋된 구현을 못 봐서 구조만 보고
+테스트를 짜게 된다.
+
+```
+register  : CLI → 커밋된 소스 전체 → MCP 가 project_files 에 저장
+generate  : CLI → 미커밋 변경분만  → MCP 가 스냅샷 위에 덮어 "현재 코드" 를 구성 → Agent
+run/test  : 같은 방식. 단 Gradle 작업 사본에 덮는 것은 미커밋 변경분뿐이다
+            (커밋분은 clone 에 이미 있다)
+```
+
+Agent 에 실어 보낼 파일은 이 순서로 고르고 `MAX_CONTEXT_FILES`(40개)에서 끊는다.
+프로젝트 전체를 보내면 프롬프트가 감당이 안 된다.
+
+1. 변경 파일 자체
+2. 그래프가 짚은 변경 단위·영향 단위·영향 파일
+3. 변경 코드가 **이름으로 참조**하는 커밋 파일 — 그래프가 비었을 때(수집 미완료·clone
+   실패)의 대비다. 이게 없으면 그래프 장애가 곧 품질 저하로 이어진다
+4. 같은 패키지의 커밋 파일 — 남는 자리를 채운다
 
 ### `test_generate(project_id, diff, sources)`
 

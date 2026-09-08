@@ -20,6 +20,7 @@ DB 세션은 그래프 조회 구간에만 연다. Agent 호출(LLM)과 Gradle �
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from sqlalchemy import select
@@ -29,7 +30,14 @@ from codetest_mcp import importance as importance_mod
 from codetest_mcp import springboot
 from codetest_mcp.agent_client import AgentError, agent_client
 from codetest_mcp.config import get_logger
-from codetest_mcp.db import GraphNode, IngestStatus, NodeType, Project, session_scope
+from codetest_mcp.db import (
+    GraphNode,
+    IngestStatus,
+    NodeType,
+    Project,
+    ProjectFile,
+    session_scope,
+)
 from codetest_mcp.executor import ExecutionError, run_tests
 from codetest_mcp.graph.impact import ImpactAnalyzer, parse_diff_ranges
 from codetest_mcp.graph.store import GraphStore
@@ -123,6 +131,151 @@ def _agent_payload(pairs: list[tuple[str, str]]) -> list[dict]:
 
 def _target_code(pairs: list[tuple[str, str]]) -> str:
     return "\n\n".join(f"### {path}\n```java\n{body}\n```" for path, body in pairs)
+
+
+# ===========================================================================
+#  0. 커밋된 소스 스냅샷 — 등록 때 받아 두고, 실행 때 미커밋 변경분을 덮는다
+# ===========================================================================
+#: Agent 프롬프트에 실을 파일 수 상한. 변경/영향 단위만 고르므로 보통 이보다 훨씬 적다.
+MAX_CONTEXT_FILES = 40
+#: 파일 하나당 본문 상한 (자). 지나치게 큰 파일이 프롬프트를 잡아먹지 않게 자른다.
+MAX_CONTEXT_CHARS = 20000
+
+
+def store_committed_sources(db: Session, project_id: str, pairs: list[tuple[str, str]]) -> int:
+    """등록 시점의 커밋된 소스를 저장한다. 같은 경로는 새 본문으로 교체한다."""
+    if not pairs:
+        return 0
+
+    existing = {
+        row.path: row
+        for row in db.scalars(
+            select(ProjectFile).where(ProjectFile.project_id == project_id)
+        )
+    }
+    for path, content in pairs:
+        row = existing.get(path)
+        if row is None:
+            db.add(ProjectFile(project_id=project_id, path=path, content=content))
+        else:
+            row.content = content
+    db.commit()
+    return len(pairs)
+
+
+def committed_sources(db: Session, project_id: str) -> dict[str, str]:
+    """등록 때 저장해 둔 커밋 소스 전체."""
+    return {
+        row.path: row.content
+        for row in db.scalars(
+            select(ProjectFile).where(ProjectFile.project_id == project_id)
+        )
+    }
+
+
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _referenced_paths(changed_contents: list[str], stored: dict[str, str]) -> list[str]:
+    """변경 코드가 이름으로 참조하는 커밋 파일을 찾는다.
+
+    그래프가 비어 있어도(개요 수집 미완료·clone 실패) 최소한의 맥락은 실어야 한다.
+    변경 파일이 `OrderService.calculateTotal(...)` 을 부르면 OrderService.java 를
+    함께 보내야 LLM 이 그 구현을 보고 테스트를 만들 수 있다.
+    """
+    words: set[str] = set()
+    for content in changed_contents:
+        words.update(_IDENTIFIER.findall(content))
+    if not words:
+        return []
+
+    hits: list[str] = []
+    for path in stored:
+        stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        if stem and stem in words:
+            hits.append(path)
+    return sorted(hits)
+
+
+def _sibling_paths(changed_paths: set[str], stored: dict[str, str]) -> list[str]:
+    """변경 파일과 같은 디렉터리(=같은 패키지)의 커밋 파일."""
+    dirs = {path.rsplit("/", 1)[0] for path in changed_paths if "/" in path}
+    return sorted(
+        path for path in stored
+        if "/" in path and path.rsplit("/", 1)[0] in dirs
+    )
+
+
+def _context_paths(
+    analysis: ChangeAnalysisResponse,
+    changed_paths: set[str],
+    changed_contents: list[str],
+    stored: dict[str, str],
+) -> list[str]:
+    """Agent 에 실어 보낼 파일 경로를 고른다.
+
+    우선순위대로 채우고 상한에서 끊는다. 프로젝트 전체를 보내면 프롬프트가 감당이
+    안 되므로 "바뀐 곳과 그에 닿는 곳" 으로 좁힌다.
+
+      1. 변경 파일 자체
+      2. 그래프가 짚은 변경 단위·영향 단위·영향 파일
+      3. 변경 코드가 이름으로 참조하는 커밋 파일  (그래프가 비었을 때의 대비)
+      4. 같은 패키지의 커밋 파일                  (남는 자리를 채운다)
+    """
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        if path and path not in seen:
+            seen.add(path)
+            ordered.append(path)
+
+    for path in sorted(changed_paths):
+        add(path)
+    for unit in analysis.changed_units:
+        add(unit.file_path)
+    for unit in analysis.impacted_units:
+        add(unit.file_path)
+    for path in analysis.affected_files:
+        add(path)
+    for path in _referenced_paths(changed_contents, stored):
+        add(path)
+    for path in _sibling_paths(changed_paths, stored):
+        add(path)
+    return ordered[:MAX_CONTEXT_FILES]
+
+
+def build_agent_sources(
+    project_id: str, analysis: ChangeAnalysisResponse, pairs: list[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    """**커밋된 코드 + 미커밋 변경분**을 합쳐 Agent 가 볼 "현재 코드" 를 만든다.
+
+    미커밋 변경분(pairs)이 같은 경로의 커밋 본문을 덮는다. 변경 파일만 보내면
+    LLM 이 호출 대상 메서드의 실제 구현을 못 봐서 구조만 보고 테스트를 짜게 된다.
+    """
+    overlay = dict(pairs)
+    changed_paths = set(overlay)
+
+    with session_scope() as db:
+        stored = committed_sources(db, project_id)
+
+    merged: list[tuple[str, str]] = []
+    for path in _context_paths(analysis, changed_paths, list(overlay.values()), stored):
+        content = overlay.get(path, stored.get(path))
+        if content is None:
+            continue
+        merged.append((path, _clip(content)))
+
+    # 그래프가 비어 영향 파일을 못 고른 경우에도 변경분은 반드시 실어 보낸다.
+    if not merged:
+        merged = [(path, _clip(content)) for path, content in pairs]
+    return merged
+
+
+def _clip(content: str) -> str:
+    if len(content) <= MAX_CONTEXT_CHARS:
+        return content
+    return content[:MAX_CONTEXT_CHARS] + "\n… (이하 생략)"
 
 
 # ===========================================================================
@@ -331,8 +484,10 @@ def test_generate(project_id: str, diff: str = "", sources=None) -> GeneratedRes
     pairs = as_pairs(sources)
     analysis = analyze(project_id, diff, pairs)
     snapshot = _snapshot(project_id)
-    judged = _ask_agent_to_generate(snapshot, analysis, pairs)
-    return _to_generated(analysis, judged, pairs)
+    # 커밋된 코드에 미커밋 변경분을 덮어 "현재 코드" 를 만들어 넘긴다.
+    context = build_agent_sources(project_id, analysis, pairs)
+    judged = _ask_agent_to_generate(snapshot, analysis, context)
+    return _to_generated(analysis, judged, context)
 
 
 def test_run(project_id: str, diff: str = "", sources=None) -> RunResult:
@@ -341,11 +496,15 @@ def test_run(project_id: str, diff: str = "", sources=None) -> RunResult:
     analysis = analyze(project_id, diff, pairs)
     snapshot = _snapshot(project_id)
 
-    judged = _ask_agent_to_generate(snapshot, analysis, pairs)
-    generated = _to_generated(analysis, judged, pairs)
+    # 커밋된 코드 + 미커밋 변경분 = Agent 가 보는 "현재 코드"
+    context = build_agent_sources(project_id, analysis, pairs)
+    judged = _ask_agent_to_generate(snapshot, analysis, context)
+    generated = _to_generated(analysis, judged, context)
     if not generated.test_code.strip():
         raise FlowError("Agent 가 Test Code 를 생성하지 못했습니다.")
 
+    # 실행 시 작업 사본에 덮어쓸 것은 **미커밋 변경분만**이다.
+    # 커밋분은 clone 에 이미 들어 있으므로 다시 덮으면 안 된다.
     execution = execute(project_id, generated.test_code, pairs, generated.base_package)
     verdict = _ask_agent_to_judge(
         project_id, execution, generated.test_code,

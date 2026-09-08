@@ -172,8 +172,17 @@ def register_project(
     owner: Annotated[str, Field(min_length=1, max_length=100, description="담당자")],
     github_token: Annotated[str | None, Field(description="Github API Token")] = None,
     default_branch: Annotated[str, Field(description="기준 브랜치")] = "main",
+    sources: Annotated[
+        list[SourceFilePayload],
+        Field(description="이미 커밋된 소스 본문 — 이후 실행에서 변경분을 덮을 바탕이 된다"),
+    ] = [],  # noqa: B006 — 읽기 전용. pydantic 이 호출마다 복사한다
 ) -> ProjectRead:
     """프로젝트를 등록하고 Git clone + AST 개요 수집을 백그라운드로 시작한다.
+
+    `sources` 로 **이미 커밋된 소스 본문**을 함께 받아 저장한다. 이후 generate/run/test
+    는 미커밋 변경분만 보내오는데, MCP 가 이 스냅샷 위에 그 변경분을 덮어 "현재 코드"
+    를 만들어 Agent 에 넘긴다. 그래야 LLM 이 변경 지점뿐 아니라 그 코드가 호출하는
+    커밋된 구현까지 보고 테스트를 만들 수 있다.
 
     즉시 ingest_status=PENDING 으로 반환한다. 수집 완료 여부는
     test_generate 응답의 analysis_warnings 로 알린다 (PENDING → RUNNING → READY/FAILED).
@@ -206,6 +215,13 @@ def register_project(
             # 같은 저장소면 재등록이 아니라 조회다 — CLI 가 project_id 를 되찾는다.
             # 지난 수집이 실패한 채로 남아 있으면 여기서 다시 시작해 준다.
             # (실패 상태 그대로 돌려주면 삭제 말고는 복구할 방법이 없다)
+            # 재등록은 스냅샷 갱신 기회다 — 그 사이 커밋이 쌓였을 수 있다.
+            refreshed = orchestrator.store_committed_sources(
+                db, existing.id, orchestrator.as_pairs(sources)
+            )
+            if refreshed:
+                logger.info("[%s] 커밋 소스 %d개 갱신", existing.name, refreshed)
+
             if existing.ingest_status == IngestStatus.FAILED.value:
                 logger.info("[%s] 지난 개요 수집이 실패해 다시 시작합니다", existing.name)
                 threading.Thread(target=run_ingest, args=(existing.id,), daemon=True).start()
@@ -224,6 +240,10 @@ def register_project(
         db.add(project)
         db.commit()
         db.refresh(project)
+
+        stored = orchestrator.store_committed_sources(db, project.id, orchestrator.as_pairs(sources))
+        if stored:
+            logger.info("[%s] 커밋 소스 %d개 저장", project.name, stored)
 
         threading.Thread(target=run_ingest, args=(project.id,), daemon=True).start()
         return _to_read(project)

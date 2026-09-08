@@ -124,12 +124,40 @@ class Project(Base, IdMixin, TimestampMixin):
     #: 언어별 파일 수 (예: {"java": 120})
     language_stats: Mapped[dict] = mapped_column(JSON, default=dict)
 
-    nodes: Mapped[list["GraphNode"]] = relationship(
+    nodes: Mapped[list[GraphNode]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
-    edges: Mapped[list["GraphEdge"]] = relationship(
+    edges: Mapped[list[GraphEdge]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
+    files: Mapped[list[ProjectFile]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+
+class ProjectFile(Base, IdMixin, TimestampMixin):
+    """등록 시점의 **커밋된 소스 본문**.
+
+    그래프(GraphNode/Edge)는 구조만 담는다. LLM 이 "이 메서드가 실제로 무엇을 하는지"
+    를 보려면 본문이 필요한데, 커밋된 코드는 Diff 에 안 잡혀 CLI 가 매번 보내지
+    않는다. 그래서 등록 때 한 번 받아 두고, 이후 실행에서 미커밋 변경분만 덮어
+    "현재 코드" 를 재구성해 Agent 에 넘긴다.
+    """
+
+    __tablename__ = "project_files"
+    __table_args__ = (
+        UniqueConstraint("project_id", "path", name="uq_project_file_path"),
+        Index("ix_project_file_path", "project_id", "path"),
+    )
+
+    project_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    #: 저장소 루트 기준 상대 경로 (예: src/main/java/com/example/demo/Foo.java)
+    path: Mapped[str] = mapped_column(String(500), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+
+    project: Mapped[Project] = relationship(back_populates="files")
 
 
 class GraphNode(Base, IdMixin, TimestampMixin):
