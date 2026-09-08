@@ -16,7 +16,8 @@ dependencies = [
     # --- 프로젝트 개요 DB (Project, Graph Node/Edge) ---
     "SQLAlchemy>=2.0",
 
-    # --- 저장소 clone ---
+    # --- 저장소 clone (스냅샷 없이 등록된 예전 프로젝트 전용 하위 호환 경로).
+    #     평소 경로는 CLI 가 올려 준 커밋 스냅샷을 쓰므로 git 실행 파일이 없어도 된다 ---
     "GitPython>=3.1",
 
     # --- AST 파싱 (LLM 토큰 미소모) ---

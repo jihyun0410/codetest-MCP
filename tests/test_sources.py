@@ -17,6 +17,9 @@ from codetest_mcp.config import settings
 from codetest_mcp.db import Base, ProjectFile, session_scope
 from codetest_mcp.main import mcp
 
+#: client fixture 가 run_ingest 를 스텁으로 바꾸므로, 진짜 함수를 미리 잡아 둔다.
+REAL_INGEST = main.run_ingest
+
 ORDER_SERVICE = "src/main/java/com/example/demo/service/OrderService.java"
 ORDER_CONTROLLER = "src/main/java/com/example/demo/controller/OrderController.java"
 
@@ -222,3 +225,56 @@ async def test_same_package_committed_files_fill_the_context(client, agent_calls
 
     sent = {item["path"] for item in agent_calls[-1]["sources"]}
     assert "src/main/java/com/example/demo/service/Helper.java" in sent
+
+
+# --- 4) git 없이도 개요가 수집돼야 한다 -----------------------------------------
+SPRING_SOURCES = [
+    {"path": "build.gradle", "content": (
+        "plugins { id 'org.springframework.boot' version '3.5.6' }\n"
+        "dependencies {\n"
+        "    implementation 'org.springframework.boot:spring-boot-starter-web'\n"
+        "}")},
+    {"path": ORDER_SERVICE, "content": (
+        "package com.example.demo.service;\n"
+        "import org.springframework.stereotype.Service;\n"
+        "@Service\n"
+        "public class OrderService {\n"
+        "    public double calculateTotal(Order order) { return 1.0; }\n"
+        "}")},
+]
+
+
+async def test_ingest_uses_the_snapshot_instead_of_cloning(client, monkeypatch):
+    """스냅샷이 있으면 clone 하지 않는다 — MCP 서버에 git 이 없어도 된다."""
+    from codetest_mcp.db import IngestStatus, Project
+    from codetest_mcp.graph.store import GraphStore
+
+    def _must_not_clone(self, branch=None):
+        raise AssertionError("스냅샷이 있는데 clone 을 시도했다")
+
+    monkeypatch.setattr(main.RepoService, "ensure_clone", _must_not_clone)
+
+    project_id = await _register(client, sources=SPRING_SOURCES)
+    REAL_INGEST(project_id)
+
+    with session_scope() as db:
+        project = db.get(Project, project_id)
+        assert project.ingest_status == IngestStatus.READY.value
+        assert project.ingest_error is None
+        assert GraphStore(db, project_id).counts_by_type()      # 그래프가 실제로 생겼다
+        # build.gradle 은 스냅샷으로만 들어온다 — clone 이 없어도 읽혀야 한다
+        assert "Spring Boot" in project.frameworks
+
+
+async def test_ingest_falls_back_to_clone_without_a_snapshot(client, monkeypatch):
+    """예전 CLI 로 등록해 스냅샷이 없으면 clone 으로 되돌아간다 (git 필요)."""
+    cloned: list[bool] = []
+    monkeypatch.setattr(
+        main.RepoService, "ensure_clone", lambda self, branch=None: cloned.append(True)
+    )
+    monkeypatch.setattr(main.RepoService, "iter_source_files", lambda self: [])
+
+    project_id = await _register(client, sources=[])
+    REAL_INGEST(project_id)
+
+    assert cloned, "스냅샷이 없으면 clone 을 시도해야 한다"

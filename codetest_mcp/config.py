@@ -54,16 +54,12 @@ class Settings(BaseSettings):
     database_url: str = Field(
         default="sqlite:///./data/codetest_mcp.db", alias="CODETEST_MCP_DATABASE_URL"
     )
-    #: 대상 프로젝트를 clone 해 두는 작업 디렉터리
+    #: 저장소를 clone 해 두는 작업 디렉터리.
+    #: 개요 수집은 CLI 가 올려 준 커밋 스냅샷으로 하므로 보통은 비어 있다 —
+    #: 스냅샷 없이 등록된 예전 프로젝트를 clone 할 때만 쓴다.
     workspace_dir: Path = Field(
         default=Path("./workspace"), alias="CODETEST_MCP_WORKSPACE_DIR"
     )
-
-    # --- 테스트 실행 (정의서: "JaCoCo와 @SpringBootTest 를 사용하여 Test Code 실행") ---
-    #: Gradle wrapper 가 없는 프로젝트에서 사용할 gradle 실행 파일
-    gradle_command: str = Field(default="gradle", alias="CODETEST_MCP_GRADLE_COMMAND")
-    #: gradle test 최대 실행 시간(초). Spring 컨텍스트 기동 + 의존성 해석을 감안한다.
-    test_timeout_seconds: int = Field(default=900, alias="CODETEST_MCP_TEST_TIMEOUT")
 
     @field_validator("api_keys", mode="before")
     @classmethod

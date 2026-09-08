@@ -2,7 +2,8 @@
 Graph 빌더 — 저장소 전체를 AST 로 파싱해 그래프를 적재한다.
 
 정의서 "[상세] 1. Git Diff와 AST로 프로젝트 개요를 파악하고 DB에 저장함":
-  · Project 최초 등록 시 Git URL 에서 전체 소스를 가져온다
+  · Project 최초 등록 시 전체 소스를 가져온다 — CLI 가 등록 때 올려 준 커밋
+    스냅샷을 쓰고, 그게 없을 때만 Git URL 에서 clone 한다
   · 개요 파악은 LLM 토큰 소비 없이 AST 파싱(Tree-sitter)만으로 진행한다
 """
 
@@ -11,7 +12,9 @@ from __future__ import annotations
 import re
 import time
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 
 from sqlalchemy.orm import Session
 
@@ -19,8 +22,13 @@ from codetest_mcp.config import get_logger
 from codetest_mcp.db import Project
 from codetest_mcp.graph.store import GraphStore
 from codetest_mcp.parsing.base import ParseResult
-from codetest_mcp.parsing.registry import detect_language, parse_source
-from codetest_mcp.repo import RepoService
+from codetest_mcp.parsing.registry import (
+    EXCLUDED_DIRS,
+    detect_language,
+    is_supported,
+    parse_source,
+)
+from codetest_mcp.repo import RepoService, SourceFile
 
 logger = get_logger(__name__)
 
@@ -55,7 +63,7 @@ _BUILD_FILE_SIGNATURES: list[tuple[str, str]] = [
     (r"\bdjango\b", "Django"),
 ]
 
-_BUILD_FILES = [
+_BUILD_FILES = (
     "pom.xml",
     "build.gradle",
     "build.gradle.kts",
@@ -63,7 +71,7 @@ _BUILD_FILES = [
     "requirements.txt",
     "pyproject.toml",
     "Pipfile",
-]
+)
 
 
 class GraphBuilder:
@@ -75,18 +83,31 @@ class GraphBuilder:
         self.store = GraphStore(db, project.id)
         self.repo = RepoService(project.id, project.git_url, project.github_token)
 
-    def build_full(self, reset: bool = True) -> BuildStats:
+    def build_full(
+        self, reset: bool = True, sources: list[SourceFile] | None = None
+    ) -> BuildStats:
         """
-        저장소를 clone(또는 최신화)하고 전체 소스를 파싱해 그래프를 재구축한다.
+        전체 소스를 파싱해 그래프를 재구축한다.
 
-        :param reset: True 면 기존 그래프를 지우고 처음부터 다시 만든다.
+        :param reset:   True 면 기존 그래프를 지우고 처음부터 다시 만든다.
+        :param sources: 파싱할 소스. 주면 그대로 쓰고, 없으면 저장소를 clone 해서 읽는다.
+
+        CLI 가 등록 때 커밋된 소스를 함께 올려 주므로 보통은 `sources` 로 들어온다.
+        그 경우 clone 이 필요 없어 **MCP 서버에 git 이 없어도 개요 수집이 된다.**
         """
         started = time.perf_counter()
         stats = BuildStats()
 
-        self.repo.ensure_clone(self.project.default_branch)
-        sources = self.repo.iter_source_files()
-        stats.file_count = len(sources)
+        cloned = sources is None
+        if cloned:
+            # 스냅샷이 없는 경우에만 저장소를 내려받는다 (git 필요).
+            self.repo.ensure_clone(self.project.default_branch)
+            sources = self.repo.iter_source_files()
+
+        # 스냅샷에는 build.gradle 처럼 파싱 대상이 아닌 파일도 함께 온다.
+        # 프레임워크 판정에는 쓰고 AST 파싱 대상에서는 뺀다.
+        parsable = [item for item in sources if is_supported(item.path)]
+        stats.file_count = len(parsable)
 
         if reset:
             self.store.clear()
@@ -94,13 +115,15 @@ class GraphBuilder:
         aggregate = ParseResult()
         language_counter: dict[str, int] = defaultdict(int)
 
-        for source_file in sources:
+        for source_file in parsable:
             language = detect_language(source_file.path) or "unknown"
             language_counter[language] += 1
             aggregate.merge(parse_source(source_file.path, source_file.content))
 
         # 빌드 파일로 프로젝트 단위 프레임워크를 보강한다.
-        aggregate.frameworks |= self._detect_frameworks_from_build_files()
+        aggregate.frameworks |= self._detect_frameworks_from_build_files(
+            sources, use_workspace=cloned
+        )
 
         # 1) 노드 저장 → 2) 심볼 인덱스 구성 → 3) 간선 해석/저장
         self.store.upsert_nodes(aggregate.nodes)
@@ -160,29 +183,49 @@ class GraphBuilder:
         return stats
 
     # ------------------------------------------------------------------
-    def _detect_frameworks_from_build_files(self) -> set[str]:
+    def _detect_frameworks_from_build_files(
+        self, sources: list[SourceFile], use_workspace: bool
+    ) -> set[str]:
         """
         pom.xml / build.gradle / package.json 등에서 프레임워크를 판정한다.
 
-        멀티모듈 프로젝트를 위해 2단계 하위까지만 훑는다.
-        (rglob 로 전체를 뒤지면 node_modules 때문에 매우 느려진다.)
+        빌드 파일은 파싱 대상이 아니라 `sources` 안에 섞여 들어온다. clone 으로
+        받아 온 경우에만 작업 사본을 훑는다 — `iter_source_files()` 는 파서가
+        지원하는 확장자만 돌려줘서 빌드 파일이 빠지기 때문이다.
         """
         found: set[str] = set()
+        for content in self._build_file_contents(sources, use_workspace):
+            for pattern, label in _BUILD_FILE_SIGNATURES:
+                if re.search(pattern, content, re.IGNORECASE):
+                    found.add(label)
+        return found
+
+    def _build_file_contents(
+        self, sources: list[SourceFile], use_workspace: bool
+    ) -> Iterator[str]:
+        """빌드 파일 본문만 골라 내놓는다 (멀티모듈 대비 2단계 하위까지)."""
+        for source_file in sources:
+            path = PurePosixPath(source_file.path.replace("\\", "/"))
+            if path.name not in _BUILD_FILES or len(path.parts) > 3:
+                continue
+            if set(path.parts[:-1]) & EXCLUDED_DIRS:
+                continue
+            yield source_file.content
+
+        if not use_workspace:
+            return
         for build_file in _BUILD_FILES:
             for candidate in self._locate_build_files(build_file):
                 try:
-                    content = candidate.read_text(encoding="utf-8", errors="ignore")
+                    yield candidate.read_text(encoding="utf-8", errors="ignore")
                 except OSError:
                     continue
-                for pattern, label in _BUILD_FILE_SIGNATURES:
-                    if re.search(pattern, content, re.IGNORECASE):
-                        found.add(label)
-        return found
 
     def _locate_build_files(self, filename: str, max_matches: int = 5) -> list:
-        """루트 / 1단계 / 2단계 하위에서만 빌드 파일을 찾는다."""
-        from codetest_mcp.parsing.registry import EXCLUDED_DIRS
+        """루트 / 1단계 / 2단계 하위에서만 빌드 파일을 찾는다.
 
+        (rglob 로 전체를 뒤지면 node_modules 때문에 매우 느려진다.)
+        """
         matches = []
         for pattern in (filename, f"*/{filename}", f"*/*/{filename}"):
             for candidate in self.repo.path.glob(pattern):

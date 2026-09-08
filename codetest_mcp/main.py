@@ -53,7 +53,7 @@ from codetest_mcp.config import get_logger, settings, setup_logging, verify_api_
 from codetest_mcp.db import IngestStatus, Project, init_db, session_scope
 from codetest_mcp.graph.builder import GraphBuilder
 from codetest_mcp.orchestrator import FlowError, project_or_fail
-from codetest_mcp.repo import RepoService
+from codetest_mcp.repo import RepoService, SourceFile
 from codetest_mcp.schemas import (
     GeneratedResult,
     PreparedTestResponse,
@@ -83,7 +83,12 @@ def _flow(call, *args, **kwargs):
 
 # --- 백그라운드 수집 ---------------------------------------------------------
 def run_ingest(project_id: str) -> None:
-    """등록 직후: clone → AST 파싱 → Graph 적재 → 개요 DB 저장 (정의서 상세 1)."""
+    """등록 직후: AST 파싱 → Graph 적재 → 개요 DB 저장 (정의서 상세 1).
+
+    CLI 가 등록 때 올려 준 **커밋 소스 스냅샷**으로 파싱한다. 그래서 이 서버에
+    git 이 없어도 개요가 수집된다. 스냅샷이 없을 때만 저장소를 clone 한다
+    (예전 CLI 로 등록했거나 sources 를 보내지 않은 경우).
+    """
     with session_scope() as db:
         project = db.get(Project, project_id)
         if project is None:
@@ -93,8 +98,21 @@ def run_ingest(project_id: str) -> None:
         project.ingest_error = None
         db.commit()
 
+        stored = orchestrator.committed_sources(db, project_id)
+        sources = (
+            [SourceFile(path=path, content=content) for path, content in stored.items()]
+            if stored
+            else None
+        )
+        if sources is None:
+            logger.info(
+                "[%s] 커밋 스냅샷이 없어 저장소를 clone 합니다 (git 필요). "
+                "최신 CLI 로 `codetest project register` 를 다시 실행하면 clone 없이 수집됩니다.",
+                project.name,
+            )
+
         try:
-            stats = GraphBuilder(db, project).build_full(reset=True)
+            stats = GraphBuilder(db, project).build_full(reset=True, sources=sources)
 
             project.ingest_status = IngestStatus.READY.value
             project.frameworks = stats.frameworks
