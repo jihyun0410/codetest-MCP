@@ -114,3 +114,63 @@ def test_detect_base_package_picks_topmost():
 
 def test_detect_base_package_ignores_non_java_sources():
     assert springboot.detect_base_package(["build.gradle", "README.md"]) is None
+
+
+# --- 주석에 속지 않아야 한다 ---------------------------------------------------
+def test_comment_mentioning_the_annotation_does_not_block_injection():
+    """설명 주석에 @SpringBootTest 가 적혀 있다고 주입을 건너뛰면
+    애너테이션 없이 실행돼 @Autowired 가 null 이 되고 NPE 가 난다."""
+    source = """package com.example.demo;
+
+// NOTE: This file is consumed by `codetest test`. The agent ensures it is
+// annotated with @SpringBootTest before executing it.
+class ProvidedOrderTest {
+    @Autowired
+    private OrderService orderService;
+}
+"""
+    prepared = springboot.prepare(source, "com.example.demo")
+
+    assert any("주입" in note for note in prepared.applied)
+    assert prepared.springboot_applied is True
+    # 주석이 아니라 클래스 선언 바로 위에 붙었는지
+    lines = prepared.source.splitlines()
+    marker = lines.index("@SpringBootTest")
+    assert lines[marker + 1].startswith("class ProvidedOrderTest")
+
+
+def test_block_comment_is_ignored_too():
+    source = """package com.example.demo;
+
+/* 이 테스트는 @SpringBootTest 로 돌아야 한다 */
+class FooTest { }
+"""
+    prepared = springboot.prepare(source, "com.example.demo")
+    assert prepared.springboot_applied is True
+    assert "@SpringBootTest\nclass FooTest" in prepared.source
+
+
+def test_string_literal_is_ignored_too():
+    source = """package com.example.demo;
+
+class FooTest {
+    String hint = "@SpringBootTest 를 붙이세요";
+}
+"""
+    prepared = springboot.prepare(source, "com.example.demo")
+    assert prepared.springboot_applied is True
+    assert "@SpringBootTest\nclass FooTest" in prepared.source
+
+
+def test_real_annotation_is_not_duplicated():
+    source = """package com.example.demo;
+
+import org.springframework.boot.test.context.SpringBootTest;
+
+@SpringBootTest
+class AlreadyTest { }
+"""
+    prepared = springboot.prepare(source, "com.example.demo")
+
+    assert prepared.applied == []
+    assert prepared.source.count("@SpringBootTest") == 1

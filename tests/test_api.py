@@ -6,7 +6,6 @@ Agent(HTTP)·Git clone·Gradle 만 대역을 쓴다 — MCP 자신은 스텁하�
 
 from __future__ import annotations
 
-import pathlib
 
 import pytest
 from fastmcp import Client
@@ -18,7 +17,6 @@ from codetest_mcp import db as db_module
 from codetest_mcp import main, orchestrator
 from codetest_mcp.config import settings
 from codetest_mcp.db import Base
-from codetest_mcp.executor import ExecutionResult
 from codetest_mcp.main import mcp
 from codetest_mcp.schemas import SourceFilePayload
 from codetest_mcp.springboot import PreparedTest
@@ -115,31 +113,6 @@ def agent(monkeypatch) -> StubAgent:
 
 
 @pytest.fixture
-def gradle(monkeypatch) -> dict:
-    """Gradle 실행과 clone 을 대역으로 바꾸고 무엇이 넘어갔는지 기록한다."""
-    captured: dict = {}
-    monkeypatch.setattr(
-        orchestrator.RepoService, "ensure_clone", lambda self, branch=None: pathlib.Path("/tmp/x")
-    )
-
-    def _run(repo_path, prepared: PreparedTest, overlay_sources=None):
-        captured["source"] = prepared.source
-        captured["file_path"] = prepared.file_path
-        captured["overlay"] = overlay_sources
-        return ExecutionResult(
-            exit_code=captured.get("exit_code", 0), output="BUILD SUCCESSFUL",
-            passed=2, failed=captured.get("failed", 0), skipped=0, total=2,
-            coverage={"line_rate": 88.0, "branch_rate": 70.0},
-            jacoco_enabled=True, test_file_path=prepared.file_path,
-            springboot_applied=prepared.springboot_applied,
-            applied=prepared.applied, command=["sh", "./gradlew", "test"],
-        )
-
-    monkeypatch.setattr(orchestrator, "run_tests", _run)
-    return captured
-
-
-@pytest.fixture
 async def client(monkeypatch, tmp_path):
     engine = create_engine(
         f"sqlite:///{tmp_path/'mcp.db'}", connect_args={"check_same_thread": False}
@@ -176,7 +149,7 @@ async def test_exposes_every_tool_the_cli_calls(client):
     names = {t.name for t in await client.list_tools()}
     assert names == {
         "hello", "register_project", "delete_project",
-        "test_generate", "test_run", "execute_tests",
+        "test_generate", "prepare_test", "report_execution",
     }
 
 
@@ -274,7 +247,7 @@ async def test_bad_git_url_is_rejected(client):
 
 
 async def test_delete_project(client, monkeypatch):
-    monkeypatch.setattr(orchestrator.RepoService, "remove", lambda self: None)
+    monkeypatch.setattr(main.RepoService, "remove", lambda self: None)
     project_id = await _register(client)
     assert (await _call(client, "delete_project", project_id=project_id))["deleted"]
     with pytest.raises(ToolError, match="찾을 수 없습니다"):
@@ -353,123 +326,95 @@ async def test_generate_hands_mcp_facts_to_the_agent(client, agent):
     assert agent.last_generate["sources"][0]["path"] == ORDER_PATH
 
 
-# --- CLI `codetest run` --------------------------------------------------------
-async def test_run_generates_executes_and_judges(client, agent, gradle):
+# --- CLI `codetest run` / `codetest test` — 실행은 CLI(개발자 PC)가 한다 --------
+PREPARE_ARGS = {
+    "test_code": "package com.example.demo;\n\nclass FooTest {\n  void t() {}\n}\n",
+}
+
+LOCAL_EXECUTION = {
+    "exit_code": 0, "output": "BUILD SUCCESSFUL",
+    "passed": 2, "failed": 0, "skipped": 0, "total": 2,
+    "failures": [], "coverage": {"line_rate": 88.0, "branch_rate": 70.0},
+    "jacoco_enabled": True, "springboot_applied": True,
+    "applied": ["@SpringBootTest 주입"], "test_file_path": "src/test/java/com/example/demo/FooTest.java",
+    "command": ["sh", "./gradlew", "test"],
+}
+
+
+async def test_prepare_injects_springboot_without_running_anything(client, agent):
+    """1단계는 문자열 변환뿐 — git·JDK·Gradle 이 필요 없다."""
     project_id = await _register(client)
-    body = await _call(client, "test_run", project_id=project_id, diff=DIFF, sources=SOURCES)
+    body = await _call(client, "prepare_test", project_id=project_id, **PREPARE_ARGS)
 
-    assert agent.calls == ["generate", "report"]
-    # (1) @SpringBootTest 가 실제로 주입되어 실행됐다
-    assert "@SpringBootTest" in gradle["source"]
-    assert gradle["overlay"][0][0] == ORDER_PATH
-
-    generated, report = body["generated"], body["report"]
-    assert generated["intent"] == "조건 변경"
-    assert report["result"] == "PASS"
-    assert report["verdict"] == "적절"                    # [UI 3] Agent 판단
-    assert report["coverage"]["line_rate"] == 88.0        # [상세 4] JaCoCo
-    assert report["springboot_applied"] is True
-    # 같은 분석에서 나온 중요도라 생성/판정 결과가 일치한다
-    assert report["importance"] == generated["importance"]
+    assert "@SpringBootTest" in body["source"]
+    assert body["springboot_applied"] is True
+    assert body["file_path"] == "src/test/java/com/example/demo/FooTest.java"
+    assert body["class_name"] == "FooTest"
+    assert agent.calls == []          # 1단계는 LLM 을 부르지 않는다
 
 
-async def test_run_sends_the_execution_facts_to_the_agent(client, agent, gradle):
+async def test_prepare_rejects_unparseable_code(client, agent):
     project_id = await _register(client)
-    await _call(client, "test_run", project_id=project_id, diff=DIFF, sources=SOURCES)
+    with pytest.raises(ToolError):
+        await _call(client, "prepare_test", project_id=project_id, test_code="// class 선언이 없다")
+
+
+async def test_prepare_rejects_empty_code(client, agent):
+    project_id = await _register(client)
+    with pytest.raises(ToolError, match="비어 있습니다"):
+        await _call(client, "prepare_test", project_id=project_id, test_code="   ")
+
+
+async def test_report_merges_local_facts_with_agent_verdict(client, agent):
+    project_id = await _register(client)
+    body = await _call(
+        client, "report_execution", project_id=project_id,
+        execution=LOCAL_EXECUTION, test_code="class FooTest {}",
+        diff=DIFF, sources=SOURCES, intent="조건 변경", intent_rationale="- 근거",
+    )
+
+    # CLI 가 준 실행 사실은 그대로
+    assert body["result"] == "PASS"
+    assert body["passed"] == 2
+    assert body["coverage"]["line_rate"] == 88.0
+    assert body["springboot_applied"] is True
+    # 적절성만 Agent 가 판단
+    assert agent.calls == ["report"]
+    assert body["verdict"] == "적절"
+    # 중요도는 MCP 가 diff 로 다시 판정
+    assert body["importance"] in {"HIGH", "MID", "LOW"}
+    assert body["importance_rationale"]
+    # 생성 때 파악한 의도가 이어진다
+    assert body["intent"] == "조건 변경"
+
+
+async def test_exit_code_beats_the_llm_opinion(client, agent):
+    """Agent 가 '적절' 이라 해도 exit code 가 사실이다."""
+    project_id = await _register(client)
+    body = await _call(
+        client, "report_execution", project_id=project_id,
+        execution={**LOCAL_EXECUTION, "exit_code": 1, "failed": 2},
+        test_code="class FooTest {}", diff=DIFF,
+    )
+    assert body["result"] == "FAIL"
+
+
+async def test_report_forwards_the_execution_facts_to_the_agent(client, agent):
+    project_id = await _register(client)
+    await _call(
+        client, "report_execution", project_id=project_id,
+        execution=LOCAL_EXECUTION, test_code="class FooTest {}", diff=DIFF,
+    )
 
     execution = agent.last_report["execution"]
     assert execution["exit_code"] == 0
     assert execution["passed"] == 2
     assert execution["coverage"]["line_rate"] == 88.0
-    assert agent.last_report["intent"] == "조건 변경"      # 생성 때 파악한 의도를 잇는다
 
 
-async def test_exit_code_beats_the_llm_opinion(client, agent, gradle):
-    """Agent 가 '적절' 이라 해도 gradle exit code 가 사실이다."""
-    project_id = await _register(client)
-    gradle["exit_code"] = 1
-    gradle["failed"] = 2
-    body = await _call(client, "test_run", project_id=project_id, diff=DIFF, sources=SOURCES)
-    assert body["report"]["result"] == "FAIL"
-
-
-async def test_run_stops_when_the_agent_returns_no_test_code(client, agent, gradle):
-    project_id = await _register(client)
-    agent.generate = lambda *a, **k: {**GENERATED, "test_code": "   "}
-    with pytest.raises(ToolError, match="Test Code"):
-        await _call(client, "test_run", project_id=project_id, diff=DIFF, sources=SOURCES)
-
-
-# --- CLI `codetest test` -------------------------------------------------------
-async def test_execute_runs_the_given_code_and_judges(client, agent, gradle):
-    project_id = await _register(client)
-    body = await _call(
-        client, "execute_tests", project_id=project_id,
-        test_code="package com.example.demo;\n\nclass FooTest {\n  void t() {}\n}\n",
-        sources=SOURCES, diff=DIFF,
-        intent="조건 변경", intent_rationale="- 이전 실행에서 파악",
-    )
-
-    assert agent.calls == ["report"]                      # 생성은 하지 않는다
-    assert "@SpringBootTest" in gradle["source"]
-    assert gradle["file_path"] == "src/test/java/com/example/demo/FooTest.java"
-    assert gradle["overlay"][0][0] == ORDER_PATH     # 미커밋 변경분이 작업 사본에 반영된다
-    assert body["result"] == "PASS"
-    assert body["verdict"] == "적절"
-    assert body["intent"] == "조건 변경"                   # 이전 의도를 그대로 싣는다
-    # diff 를 함께 받았으므로 이번 실행에서도 중요도를 판단한다
-    assert body["importance"] in {"HIGH", "MID", "LOW"}
-    assert "영향도 점수" in body["importance_rationale"]
-
-
-async def test_execute_honours_base_package(client, agent, gradle):
-    project_id = await _register(client)
-    await _call(client, "execute_tests", project_id=project_id,
-                test_code="class FooTest {}", base_package="com.acme.billing")
-    assert gradle["file_path"] == "src/test/java/com/acme/billing/FooTest.java"
-
-
-async def test_execute_rejects_empty_test_code(client, agent):
-    project_id = await _register(client)
-    with pytest.raises(ToolError, match="비어 있습니다"):
-        await _call(client, "execute_tests", project_id=project_id, test_code="   ")
-
-
-async def test_execute_rejects_unparseable_test_code(client, agent, gradle):
-    project_id = await _register(client)
-    with pytest.raises(ToolError):
-        await _call(client, "execute_tests",
-                    project_id=project_id, test_code="// class 선언이 없다")
-
-
-async def test_execute_surfaces_missing_gradle(client, agent, monkeypatch):
-    from codetest_mcp.executor import ExecutionError
-
-    project_id = await _register(client)
-    monkeypatch.setattr(
-        orchestrator.RepoService, "ensure_clone", lambda self, b=None: pathlib.Path("/tmp/x")
-    )
-
-    def _boom(*args, **kwargs):
-        raise ExecutionError("Gradle 을 찾을 수 없습니다.")
-
-    monkeypatch.setattr(orchestrator, "run_tests", _boom)
-    with pytest.raises(ToolError, match="Gradle"):
-        await _call(client, "execute_tests", project_id=project_id, test_code="class T {}")
-
-
-# --- Agent 장애 전파 -----------------------------------------------------------
-async def test_agent_failure_is_surfaced_to_the_cli(client, agent, monkeypatch):
-    from codetest_mcp.agent_client import AgentError
-
-    project_id = await _register(client)
-
-    def _boom(*args, **kwargs):
-        raise AgentError("Agent 에 연결할 수 없습니다: http://localhost:8000/api/v1")
-
-    agent.generate = _boom
-    with pytest.raises(ToolError, match="Agent 생성 호출 실패"):
-        await _call(client, "test_generate", project_id=project_id, diff=DIFF)
+async def test_report_unknown_project_is_rejected(client, agent):
+    with pytest.raises(ToolError, match="찾을 수 없습니다"):
+        await _call(client, "report_execution", project_id="nope", execution=LOCAL_EXECUTION)
 
 
 # --- 인증 (http 전송에서만 검사) -----------------------------------------------

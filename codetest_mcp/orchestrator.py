@@ -38,18 +38,16 @@ from codetest_mcp.db import (
     ProjectFile,
     session_scope,
 )
-from codetest_mcp.executor import ExecutionError, run_tests
 from codetest_mcp.graph.impact import ImpactAnalyzer, parse_diff_ranges
 from codetest_mcp.graph.store import GraphStore
-from codetest_mcp.repo import RepoService
 from codetest_mcp.schemas import (
     ChangeAnalysisResponse,
     ChangedUnit,
     ExecuteResponse,
     GeneratedResult,
     ImpactedUnit,
+    PreparedTestResponse,
     ReportResult,
-    RunResult,
     SourceFilePayload,
 )
 
@@ -93,7 +91,7 @@ def _snapshot(project_id: str) -> ProjectSnapshot:
         )
 
 
-def base_package(db: Session, project_id: str) -> str | None:
+def project_base_package(db: Session, project_id: str) -> str | None:
     """저장된 그래프의 파일 경로에서 기준 패키지를 추론한다."""
     paths = list(
         db.scalars(
@@ -347,54 +345,10 @@ def analyze(project_id: str, diff: str = "", sources=None) -> ChangeAnalysisResp
             importance=verdict.importance,
             importance_rationale=verdict.rationale,
             frameworks=project.frameworks or [],
-            base_package=base_package(db, project.id),
+            base_package=project_base_package(db, project.id),
             graph_ready=graph_ready,
             warnings=warnings,
         )
-
-
-# ===========================================================================
-#  2. @SpringBootTest 주입 + JaCoCo 실행 (정의서 (1), [상세] 4) — LLM 미개입
-# ===========================================================================
-def execute(
-    project_id: str, test_code: str, sources=None, base_package_hint: str | None = None
-) -> ExecuteResponse:
-    """생성된 Test Code 를 @SpringBootTest 로 실행한다. 판정은 하지 않는다."""
-    snapshot = _snapshot(project_id)
-    if base_package_hint is None:
-        with session_scope() as db:
-            base_package_hint = base_package(db, snapshot.id)
-
-    try:
-        prepared = springboot.prepare(test_code, base_package_hint)
-    except ValueError as exc:
-        raise FlowError(str(exc)) from None
-
-    repo = RepoService(snapshot.id, snapshot.git_url, snapshot.github_token)
-    try:
-        repo.ensure_clone(snapshot.default_branch)
-        result = run_tests(repo.path, prepared, overlay_sources=as_pairs(sources))
-    except ExecutionError as exc:
-        raise FlowError(str(exc)) from None
-    except Exception as exc:
-        raise FlowError(f"테스트 실행 실패: {exc}") from None
-
-    return ExecuteResponse(
-        project_id=snapshot.id,
-        exit_code=result.exit_code,
-        output=result.output,
-        passed=result.passed,
-        failed=result.failed,
-        skipped=result.skipped,
-        total=result.total,
-        failures=result.failures,
-        coverage=result.coverage,
-        jacoco_enabled=result.jacoco_enabled,
-        springboot_applied=result.springboot_applied,
-        applied=result.applied,
-        test_file_path=result.test_file_path,
-        command=result.command,
-    )
 
 
 # ===========================================================================
@@ -490,53 +444,72 @@ def test_generate(project_id: str, diff: str = "", sources=None) -> GeneratedRes
     return _to_generated(analysis, judged, context)
 
 
-def test_run(project_id: str, diff: str = "", sources=None) -> RunResult:
-    """`codetest run` — 분석 → 생성 → 실행 → 판정을 한 번에 (정의서 흐름 3~5)."""
-    pairs = as_pairs(sources)
-    analysis = analyze(project_id, diff, pairs)
-    snapshot = _snapshot(project_id)
+def prepare_test(
+    project_id: str, test_code: str, base_package: str | None = None
+) -> PreparedTestResponse:
+    """`codetest test` 1단계 — @SpringBootTest 를 주입하고 저장 경로를 계산한다.
 
-    # 커밋된 코드 + 미커밋 변경분 = Agent 가 보는 "현재 코드"
-    context = build_agent_sources(project_id, analysis, pairs)
-    judged = _ask_agent_to_generate(snapshot, analysis, context)
-    generated = _to_generated(analysis, judged, context)
-    if not generated.test_code.strip():
-        raise FlowError("Agent 가 Test Code 를 생성하지 못했습니다.")
-
-    # 실행 시 작업 사본에 덮어쓸 것은 **미커밋 변경분만**이다.
-    # 커밋분은 clone 에 이미 들어 있으므로 다시 덮으면 안 된다.
-    execution = execute(project_id, generated.test_code, pairs, generated.base_package)
-    verdict = _ask_agent_to_judge(
-        project_id, execution, generated.test_code,
-        generated.intent, generated.intent_rationale,
-    )
-    report = _to_report(
-        execution, verdict, analysis, generated.intent, generated.intent_rationale
-    )
-    return RunResult(generated=generated, report=report)
-
-
-def execute_tests(
-    project_id: str,
-    test_code: str,
-    sources=None,
-    base_package: str | None = None,
-    diff: str = "",
-    intent: str = "",
-    intent_rationale: str = "",
-) -> ReportResult:
-    """`codetest test` — src/test/test.txt 의 Test Code 를 실행하고 판정한다.
-
-    `diff` 는 기능 중요도를 다시 판단하기 위해 받는다. CLI 가 보내지 않으면
-    `sources` 만으로 판단하므로 변경 구간이 파일 전체로 잡혀 등급이 높게 나올 수 있다.
+    실행은 **CLI 가 개발자 PC 의 프로젝트에서** 한다. 여기서 하는 일은 코드 기반
+    문자열 변환뿐이라 git·JDK·Gradle 이 필요 없다 (정의서: 코드 기반 처리 = MCP).
     """
     if not test_code.strip():
         raise FlowError("실행할 Test Code 가 비어 있습니다.")
 
+    if base_package is None:
+        with session_scope() as db:
+            project_or_fail(db, project_id)
+            base_package_hint = project_base_package(db, project_id)
+    else:
+        base_package_hint = base_package
+
+    try:
+        prepared = springboot.prepare(test_code, base_package_hint)
+    except ValueError as exc:
+        raise FlowError(str(exc)) from None
+
+    return PreparedTestResponse(
+        project_id=project_id,
+        source=prepared.source,
+        file_path=prepared.file_path,
+        class_name=prepared.class_name,
+        package=prepared.package,
+        springboot_applied=prepared.springboot_applied,
+        applied=list(prepared.applied),
+    )
+
+
+def report_execution(
+    project_id: str,
+    execution: dict,
+    test_code: str,
+    diff: str = "",
+    sources=None,
+    intent: str = "",
+    intent_rationale: str = "",
+) -> ReportResult:
+    """`codetest test` 2단계 — CLI 가 로컬에서 돌린 결과를 받아 리포트를 만든다.
+
+    실행 집계는 CLI 가 준 사실을 그대로 쓰고, 기능 중요도는 MCP 가 다시 판정하며,
+    결과 적절성만 Agent(LLM)에 묻는다.
+    """
     pairs = as_pairs(sources)
     analysis = analyze(project_id, diff, pairs)
-    execution = execute(project_id, test_code, pairs, base_package or analysis.base_package)
-    verdict = _ask_agent_to_judge(
-        project_id, execution, test_code, intent, intent_rationale
+
+    facts = ExecuteResponse(
+        project_id=project_id,
+        exit_code=int(execution.get("exit_code", 0)),
+        output=str(execution.get("output", "")),
+        passed=int(execution.get("passed", 0)),
+        failed=int(execution.get("failed", 0)),
+        skipped=int(execution.get("skipped", 0)),
+        total=int(execution.get("total", 0)),
+        failures=list(execution.get("failures") or []),
+        coverage=execution.get("coverage"),
+        jacoco_enabled=bool(execution.get("jacoco_enabled", False)),
+        springboot_applied=bool(execution.get("springboot_applied", False)),
+        applied=list(execution.get("applied") or []),
+        test_file_path=str(execution.get("test_file_path", "")),
+        command=list(execution.get("command") or []),
     )
-    return _to_report(execution, verdict, analysis, intent, intent_rationale)
+    judged = _ask_agent_to_judge(project_id, facts, test_code, intent, intent_rationale)
+    return _to_report(facts, judged, analysis, intent, intent_rationale)

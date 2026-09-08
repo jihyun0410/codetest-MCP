@@ -17,8 +17,12 @@ LLM 판단이 필요한 부분만 Agent(codetest)에 FastAPI 로 넘긴 뒤 결�
   register_project      프로젝트 등록 + Git clone + AST → 개요 DB 저장   (상세 1)
   delete_project        등록 정보/그래프/작업 사본 삭제
   test_generate         codetest generate — 분석 → Agent 생성
-  test_run              codetest run      — 분석 → 생성 → 실행 → 판정
-  execute_tests         codetest test     — 실행 → 판정                 (1), (상세 4)
+  prepare_test          @SpringBootTest 주입 + 저장 경로 계산            (1)
+  report_execution      로컬 실행 결과 → 중요도 재판정 + Agent 적절성 판정 (상세 4)
+
+**테스트 실행은 이 서버가 하지 않는다.** CLI 가 개발자 PC 의 프로젝트에서 Gradle 로
+돌리고 그 결과만 report_execution 으로 보내온다. 그래서 실행 단계에는 git·JDK·Gradle
+이 필요 없다 (등록 시 AST 수집에는 여전히 clone 이 필요하다).
 
 프로젝트 개요 조회와 변경 단위 식별은 **도구로 노출하지 않는다.** CLI 가 직접 쓸 일이
 없고, test_generate / test_run 이 내부에서(`orchestrator.analyze`) 만들어 쓰는 중간
@@ -52,9 +56,9 @@ from codetest_mcp.orchestrator import FlowError, project_or_fail
 from codetest_mcp.repo import RepoService
 from codetest_mcp.schemas import (
     GeneratedResult,
+    PreparedTestResponse,
     ProjectRead,
     ReportResult,
-    RunResult,
     SourceFilePayload,
 )
 
@@ -279,48 +283,46 @@ def test_generate(
 
 
 @mcp.tool()
-def test_run(
-    project_id: str,
-    diff: Annotated[str, Field(description="변경분 unified diff")] = "",
-    sources: Annotated[
-        list[SourceFilePayload], Field(description="변경 파일 본문 (테스트 대상 코드)")
-    ] = [],  # noqa: B006
-) -> RunResult:
-    """`codetest run` — 분석 → 생성 → 실행 → 판정을 한 번에 (정의서 흐름 3~5).
-
-    Gradle 빌드와 Spring 컨텍스트 기동이 포함되어 수 분이 걸릴 수 있다.
-    """
-    return _flow(orchestrator.test_run, project_id, diff, sources)
-
-
-# --- 테스트 실행 + 판정 (정의서 (1), 상세 4) ------------------------------------
-@mcp.tool()
-def execute_tests(
+def prepare_test(
     project_id: str,
     test_code: Annotated[str, Field(description="실행할 Java 테스트 소스")],
-    sources: Annotated[
-        list[SourceFilePayload],
-        Field(description="실행 전에 작업 사본에 덮어쓸 변경 파일 (미커밋 변경분)"),
-    ] = [],  # noqa: B006
     base_package: Annotated[
         str | None,
         Field(description="package 선언이 없을 때 쓸 기준 패키지. 생략하면 개요에서 찾는다"),
     ] = None,
+) -> PreparedTestResponse:
+    """`codetest run` / `codetest test` 1단계 — @SpringBootTest 를 주입한다.
+
+    @SpringBootTest 가 없으면 붙이고 import/package 선언도 보강한 뒤
+    src/test/java/<package>/<Class>.java 저장 경로를 계산해 돌려준다.
+    **실행은 CLI 가 개발자 PC 의 프로젝트에서 한다** — 이 단계는 문자열 변환뿐이라
+    git·JDK·Gradle 이 필요 없다.
+    """
+    return _flow(orchestrator.prepare_test, project_id, test_code, base_package)
+
+
+@mcp.tool()
+def report_execution(
+    project_id: str,
+    execution: Annotated[dict, Field(description="CLI 가 로컬에서 돌린 실행 결과")],
+    test_code: Annotated[str, Field(description="실행한 Java 테스트 소스")] = "",
     diff: Annotated[
         str, Field(description="변경분 unified diff — 기능 중요도를 다시 판단하는 데 쓴다")
     ] = "",
+    sources: Annotated[
+        list[SourceFilePayload], Field(description="미커밋 변경 파일 본문")
+    ] = [],  # noqa: B006
     intent: Annotated[str, Field(description="이전에 파악한 변경 의도")] = "",
     intent_rationale: Annotated[str, Field(description="그 의도의 근거")] = "",
 ) -> ReportResult:
-    """`codetest test` — Test Code 를 @SpringBootTest 로 실행하고 적절성을 판정한다.
+    """`codetest run` / `codetest test` 2단계 — 로컬 실행 결과로 리포트를 만든다.
 
-    @SpringBootTest 가 없으면 주입하고 import/package 선언도 보강한 뒤
-    src/test/java/<package>/<Class>.java 로 저장해 gradle test 를 돌린다.
-    실행 사실은 MCP 가, 적절성 판단은 Agent(LLM)가 만든다.
+    실행 집계는 CLI 가 준 사실을 그대로 쓰고, 기능 중요도는 MCP 가 코드로 다시
+    판정하며, 결과 적절성만 Agent(LLM)가 판단한다.
     """
     return _flow(
-        orchestrator.execute_tests,
-        project_id, test_code, sources, base_package, diff, intent, intent_rationale,
+        orchestrator.report_execution,
+        project_id, execution, test_code, diff, sources, intent, intent_rationale,
     )
 
 

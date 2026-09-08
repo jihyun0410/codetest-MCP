@@ -35,8 +35,20 @@ CLI(codereview_gitver)  →  MCP(codetest-MCP)  →  Agent(codetest)
 | `register_project` | 프로젝트 등록 + **커밋 소스 스냅샷 저장** + 개요 수집(백그라운드). 같은 이름·같은 git_url 로 다시 부르면 기존 프로젝트를 그대로 돌려주고 스냅샷을 갱신한다 |
 | `delete_project` | 프로젝트·그래프·작업 사본 삭제 |
 | `test_generate` | 변경 분석 + 중요도 판정 + Test Code 생성 (CLI `codetest generate`) |
-| `test_run` | 생성 + `@SpringBootTest` 실행 + 적절성 판정 (CLI `codetest run`) |
-| `execute_tests` | `@SpringBootTest` 주입 + JaCoCo 실행 + 판정 (CLI `codetest test`) |
+| `prepare_test` | `@SpringBootTest` 주입 + 저장 경로 계산 (실행 전 1단계) |
+| `report_execution` | 로컬 실행 결과 → 중요도 재판정 + 적절성 판정 (실행 후 2단계) |
+
+> **테스트 실행은 이 서버가 하지 않는다.** CLI 가 개발자 PC 의 프로젝트에서 Gradle 로
+> 돌리고 그 결과만 `report_execution` 으로 보내온다. 개발자가 방금 고친 코드가 그대로
+> 있는 작업 트리라 사본을 만들 필요가 없고, MCP 서버에 JDK·Gradle 이 필요 없다.
+> (등록 시 AST 수집에는 여전히 clone 이 필요하므로 git 은 있어야 한다.)
+>
+> ```
+> codetest run / test
+>   1. prepare_test      MCP  @SpringBootTest 주입, 경로 계산   (git·JDK·Gradle 불필요)
+>   2. gradle test       CLI  개발자 PC 의 프로젝트에서 실행
+>   3. report_execution  MCP  중요도 재판정 → Agent 적절성 판정
+> ```
 
 > 프로젝트 개요 조회(`get_project_overview`)와 변경 단위 식별(`analyze_changes`)은
 > **도구로 노출하지 않는다.** CLI 가 직접 쓸 일이 없고, `test_generate` / `test_run` 이

@@ -169,6 +169,25 @@ class GeneratedResult(BaseModel):
     analysis_warnings: list[str] = Field(default_factory=list)
 
 
+class PreparedTestResponse(BaseModel):
+    """`prepare_test` 응답 — @SpringBootTest 주입을 마친 소스와 저장 위치.
+
+    실행은 CLI 가 개발자 PC 의 프로젝트에서 한다. MCP 는 문자열 변환만 하므로
+    이 단계에는 git·JDK·Gradle 이 필요 없다.
+    """
+
+    project_id: str
+    #: package/import/@SpringBootTest 를 보강한 최종 Java 소스
+    source: str
+    #: 저장소 루트 기준 상대 경로 (예: src/test/java/com/example/demo/FooTest.java)
+    file_path: str
+    class_name: str
+    package: str
+    springboot_applied: bool = False
+    #: 실제로 수행한 변환 목록 (리포트에 근거로 남는다)
+    applied: list[str] = Field(default_factory=list)
+
+
 class ReportResult(BaseModel):
     """`test_run` / `execute_tests` 의 실행+판정 결과 (CLI `codetest test`)."""
 
@@ -201,10 +220,3 @@ class ReportResult(BaseModel):
     test_file_path: str = ""
     exit_code: int = 0
     output: str = ""
-
-
-class RunResult(BaseModel):
-    """`test_run` — 생성과 판정을 함께 돌려준다 (CLI `codetest run`)."""
-
-    generated: GeneratedResult
-    report: ReportResult

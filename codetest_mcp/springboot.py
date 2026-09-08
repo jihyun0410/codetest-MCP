@@ -36,6 +36,24 @@ _CLASS_DECL_RE = re.compile(
 )
 _IMPORT_RE = re.compile(r"^\s*import\s+(?:static\s+)?([\w.*]+)\s*;", re.MULTILINE)
 
+#: 줄 주석 / 블록 주석 / 문자열 리터럴
+_NON_CODE = re.compile(
+    r'//[^\n]*'          # 줄 주석
+    r'|/\*.*?\*/'        # 블록 주석
+    r'|"(?:\\.|[^"\\])*"',  # 문자열 리터럴
+    re.DOTALL,
+)
+
+
+def _code_only(source: str) -> str:
+    """주석과 문자열 리터럴을 지운 사본.
+
+    `@SpringBootTest` 가 **실제 애너테이션으로** 있는지 판단하는 데 쓴다.
+    설명 주석에 그 낱말이 적혀 있다는 이유로 주입을 건너뛰면, 애너테이션이 없는
+    채로 실행돼 @Autowired 가 null 이 되고 NullPointerException 이 난다.
+    """
+    return _NON_CODE.sub(" ", source)
+
 
 @dataclass
 class PreparedTest:
@@ -51,7 +69,7 @@ class PreparedTest:
 
     @property
     def springboot_applied(self) -> bool:
-        return SPRING_BOOT_TEST in self.source
+        return SPRING_BOOT_TEST in _code_only(self.source)
 
 
 def prepare(test_code: str, base_package: str | None = None) -> PreparedTest:
@@ -79,7 +97,7 @@ def prepare(test_code: str, base_package: str | None = None) -> PreparedTest:
     if class_name is None:
         raise ValueError("테스트 소스에서 class 선언을 찾지 못했습니다.")
 
-    if SPRING_BOOT_TEST not in source:
+    if SPRING_BOOT_TEST not in _code_only(source):
         source = _inject_annotation(source, class_name)
         applied.append(f"{SPRING_BOOT_TEST} 주입 (class {class_name})")
 
@@ -136,7 +154,7 @@ def _ensure_imports(source: str) -> tuple[str, list[str]]:
     existing = set(_IMPORT_RE.findall(source))
     needed: list[str] = []
 
-    if SPRING_BOOT_TEST in source and not _covered(existing, _IMPORT_SPRING_BOOT_TEST):
+    if SPRING_BOOT_TEST in _code_only(source) and not _covered(existing, _IMPORT_SPRING_BOOT_TEST):
         needed.append(_IMPORT_SPRING_BOOT_TEST)
     if re.search(r"@Test\b", source) and not _covered(existing, _IMPORT_JUNIT_TEST):
         needed.append(_IMPORT_JUNIT_TEST)
