@@ -296,6 +296,8 @@ def test_generate(
     """`codetest generate` — 변경 의도를 파악하고 @SpringBootTest 를 생성한다.
 
     MCP 가 변경 단위·영향도·중요도를 확정한 뒤 Agent 에 생성을 맡긴다. 실행은 하지 않는다.
+    Agent 를 기다리는 동안 끊기지 않는 것은 `agent_client` 가 keep-alive 스트림으로
+    받기 때문이다 (CLI 쪽 SSE 는 sse-starlette 가 15초마다 ping 을 보낸다).
     """
     return _flow(orchestrator.test_generate, project_id, diff, sources)
 

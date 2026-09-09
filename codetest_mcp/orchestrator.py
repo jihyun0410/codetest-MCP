@@ -137,7 +137,16 @@ def _target_code(pairs: list[tuple[str, str]]) -> str:
 #: Agent 프롬프트에 실을 파일 수 상한. 변경/영향 단위만 고르므로 보통 이보다 훨씬 적다.
 MAX_CONTEXT_FILES = 40
 #: 파일 하나당 본문 상한 (자). 지나치게 큰 파일이 프롬프트를 잡아먹지 않게 자른다.
+#: 자른 자리에는 표시를 남긴다 — 모델이 그 파일의 뒷부분을 다 봤다고 믿으면
+#: 없는 시그니처를 지어낸다.
 MAX_CONTEXT_CHARS = 20000
+#: Agent 로 보낼 맥락 전체의 상한 (자).
+#:
+#: 프롬프트 길이는 그대로 생성 시간이 된다. 예전에는 상한이 파일당으로만 있어서
+#: 최악의 경우 40개 × 2만 자 = 80만 자를 보냈고, Agent 는 그것을 이어 붙인 뒤
+#: 앞에서 4만 자만 남기고 잘랐다 — 보내느라 든 시간은 다 쓰고 정작 뒤쪽 맥락은
+#: 버려지는 구조였다. 이제 MCP 가 우선순위대로 예산 안에서 끊어 보낸다.
+MAX_CONTEXT_TOTAL_CHARS = 45000
 
 
 def store_committed_sources(db: Session, project_id: str, pairs: list[tuple[str, str]]) -> int:
@@ -258,11 +267,22 @@ def build_agent_sources(
         stored = committed_sources(db, project_id)
 
     merged: list[tuple[str, str]] = []
+    budget = MAX_CONTEXT_TOTAL_CHARS
+
     for path in _context_paths(analysis, changed_paths, list(overlay.values()), stored):
         content = overlay.get(path, stored.get(path))
         if content is None:
             continue
-        merged.append((path, _clip(content)))
+        body = _clip(content)
+
+        # 변경 파일은 테스트의 대상 그 자체라 예산과 무관하게 싣는다.
+        # 맥락 파일은 남는 자리에만 넣고, 안 들어가면 통째로 뺀다 —
+        # 우선순위가 낮더라도 들어갈 수 있는 파일을 대신 채우는 편이 낫다.
+        if path not in changed_paths:
+            if len(body) > budget:
+                continue
+            budget -= len(body)
+        merged.append((path, body))
 
     # 그래프가 비어 영향 파일을 못 고른 경우에도 변경분은 반드시 실어 보낸다.
     if not merged:

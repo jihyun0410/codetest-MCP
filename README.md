@@ -75,14 +75,19 @@ run/test  : 같은 방식. 실행은 CLI 가 개발자 PC 의 작업 트리에�
             리포트를 만들 "현재 코드" 만 조립한다
 ```
 
-Agent 에 실어 보낼 파일은 이 순서로 고르고 `MAX_CONTEXT_FILES`(40개)에서 끊는다.
-프로젝트 전체를 보내면 프롬프트가 감당이 안 된다.
+Agent 에 실어 보낼 파일은 이 순서로 고르고 `MAX_CONTEXT_FILES`(40개)와
+`MAX_CONTEXT_TOTAL_CHARS`(45,000자) 중 먼저 걸리는 쪽에서 끊는다. 프롬프트 길이는
+그대로 생성 시간이 되므로 "바뀐 곳과 그에 닿는 곳" 으로 좁힌다.
 
 1. 변경 파일 자체
 2. 그래프가 짚은 변경 단위·영향 단위·영향 파일
 3. 변경 코드가 **이름으로 참조**하는 커밋 파일 — 그래프가 비었을 때(수집 미완료·수집
    실패)의 대비다. 이게 없으면 그래프 장애가 곧 품질 저하로 이어진다
 4. 같은 패키지의 커밋 파일 — 남는 자리를 채운다
+
+**변경 파일은 예산과 무관하게 항상 싣는다** — 그게 테스트의 대상이다. 맥락 파일은
+남는 자리에만 넣고, 예산을 넘으면 잘라 넣지 않고 통째로 뺀다. 메서드 중간에서
+끊긴 클래스를 보내면 모델이 그것을 파일 전체로 믿고 없는 시그니처를 지어낸다.
 
 ### 스냅샷은 개요 수집(AST)에도 쓴다 — **MCP 서버에 git 이 필요 없다**
 
@@ -163,6 +168,30 @@ CLI 로 등록한 프로젝트가 그렇다. 이때는 서버에 git 이 있어�
 `codetest run` 은 `test_generate` → `prepare_test` → (로컬 Gradle) → `report_execution`
 순서로 이 도구들을 이어 붙인다. 흐름 조립은 `orchestrator.py` 가 맡는다.
 
+## Agent 호출 — 504 Gateway Time-out 을 만드는 것
+
+앞단 nginx 의 `proxy_read_timeout` 은 **총 소요 시간이 아니라 무응답 시간**이다.
+예전에는 Agent 가 LLM 을 다 기다린 뒤 JSON 을 한 덩어리로 보냈으므로, 생성이 3분
+걸리면 그 3분 내내 이 구간이 조용했다 — 60초에 프록시가 끊고 504 를 만든다.
+`CODETEST_MCP_AGENT_GENERATE_TIMEOUT` 을 아무리 늘려도 소용이 없었던 이유다
+(프록시가 먼저 끊으므로 그 값은 애초에 도달하지 않는다).
+
+이제 `agent_client` 는 `Accept: application/x-ndjson` 으로 요청해 생성 중에도
+`{"type":"ping"}` 줄을 계속 받는다. ping 은 버리고 마지막 `result`/`error` 줄만 쓴다.
+Accept 를 이해하지 못하는 예전 Agent 는 예전처럼 JSON 으로 답하고, 그것도 그대로 받는다.
+
+측정값 (LLM 이 25초 걸리는 스텁):
+
+| 구간 | 바이트 사이 최대 침묵 |
+|---|---|
+| MCP → Agent, 수정 전 | **25.1s** (= 생성 시간 그대로) |
+| MCP → Agent, 수정 후 | **10.1s** (= ping 간격) |
+| CLI → MCP | 15.0s (sse-starlette 가 SSE 에 자체 ping 을 넣는다) |
+
+그래서 타임아웃 설정도 총 시간이 아니라 무응답 시간으로 바꿨다
+(`CODETEST_MCP_AGENT_STREAM_IDLE`). 오래 걸리는 생성은 기다리고, 조용히 죽은
+Agent 는 2분 만에 포기한다.
+
 ## 실행
 
 ```bash
@@ -188,7 +217,8 @@ export CODETEST_API_KEY="…"        # CODETEST_MCP_API_KEYS 중 하나
 | `CODETEST_MCP_TRANSPORT` | `streamable-http` | `streamable-http` 또는 `stdio` |
 | `CODETEST_MCP_AGENT_URL` | `http://localhost:8000` | Agent(LLM 판단) FastAPI 주소 |
 | `CODETEST_MCP_AGENT_API_KEY` | (없음) | Agent 가 요구하는 `X-API-Key` |
-| `CODETEST_MCP_AGENT_TIMEOUT` | `600` | Agent 응답 대기 시간(초) |
+| `CODETEST_MCP_AGENT_TIMEOUT` | `60` | Agent 일반 요청(헬스 등) 대기 시간(초) |
+| `CODETEST_MCP_AGENT_STREAM_IDLE` | `120` | LLM 호출의 **무응답** 상한(초). 총 소요 시간이 아니다 |
 | `CODETEST_MCP_PORT` | `80` | 수신 포트. root 아니면 `8100` 등으로 바꿀 것 |
 | `CODETEST_MCP_API_KEYS` | (없음) | Agent 인증 키(CSV). 비우면 인증 비활성화 |
 | `CODETEST_MCP_DATABASE_URL` | `sqlite:///./data/codetest_mcp.db` | 개요/그래프 저장소 |

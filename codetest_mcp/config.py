@@ -46,9 +46,13 @@ class Settings(BaseSettings):
     agent_timeout_seconds: float = Field(
         default=60.0, alias="CODETEST_MCP_AGENT_TIMEOUT"
     )
-    #: LLM 생성/판정은 오래 걸린다
-    agent_generate_timeout_seconds: float = Field(
-        default=600.0, alias="CODETEST_MCP_AGENT_GENERATE_TIMEOUT"
+    #: LLM 호출은 총 소요 시간이 아니라 **무응답 시간**으로 끊는다.
+    #: Agent 가 생성 중에 keep-alive 를 흘려보내므로, 살아 있는 한 이 타이머는
+    #: 계속 초기화된다. 즉 오래 걸리는 생성은 기다리고 죽은 Agent 는 빨리 포기한다.
+    #: (예전 CODETEST_MCP_AGENT_GENERATE_TIMEOUT 을 대신한다 — 총 시간 상한이던
+    #:  그 값은 앞단 nginx 가 먼저 504 를 내는 바람에 실효가 없었다.)
+    agent_stream_idle_seconds: float = Field(
+        default=120.0, alias="CODETEST_MCP_AGENT_STREAM_IDLE"
     )
 
     database_url: str = Field(

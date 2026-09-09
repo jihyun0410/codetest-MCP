@@ -167,6 +167,45 @@ async def test_long_file_is_clipped(client, agent_calls):
     assert sent.endswith("(이하 생략)")
 
 
+async def test_total_context_stays_within_the_prompt_budget(client, agent_calls):
+    """프롬프트 길이는 그대로 생성 시간이 된다 — 맥락 전체에 예산을 둔다."""
+    body = "class Ctx { " + "int x; " * 1500 + "}"      # 파일당 약 1만 자
+    many = [
+        {"path": f"src/main/java/com/example/demo/service/Ctx{i}.java", "content": body}
+        for i in range(20)
+    ]
+    project_id = await _register(client, sources=[*many, {"path": ORDER_SERVICE, "content": "class OrderService {}"}])
+
+    await client.call_tool("test_generate", {
+        "project_id": project_id, "diff": "",
+        "sources": [{"path": ORDER_SERVICE, "content": "class OrderService { /* 수정 */ }"}],
+    })
+
+    sent = agent_calls[-1]["sources"]
+    total = sum(len(item["content"]) for item in sent)
+    # 변경 파일은 예산과 무관하게 실리므로 그만큼의 여유를 둔다
+    assert total <= orchestrator.MAX_CONTEXT_TOTAL_CHARS + orchestrator.MAX_CONTEXT_CHARS
+    assert len(sent) < len(many), "예산을 넘는 맥락 파일은 빠져야 한다"
+
+
+async def test_changed_file_is_sent_even_when_the_budget_is_gone(client, agent_calls):
+    """예산이 다 차도 변경 파일은 반드시 실어야 한다 — 그게 테스트의 대상이다."""
+    filler = "class Ctx { " + "int x; " * 1500 + "}"
+    many = [
+        {"path": f"src/main/java/com/example/demo/service/Ctx{i}.java", "content": filler}
+        for i in range(20)
+    ]
+    project_id = await _register(client, sources=many)
+
+    await client.call_tool("test_generate", {
+        "project_id": project_id, "diff": "",
+        "sources": [{"path": ORDER_SERVICE, "content": "class OrderService { /* 수정 */ }"}],
+    })
+
+    paths = {item["path"] for item in agent_calls[-1]["sources"]}
+    assert ORDER_SERVICE in paths
+
+
 # --- 3) 그래프가 비어도 맥락은 실어야 한다 -------------------------------------
 async def test_referenced_committed_file_is_sent_without_a_graph(client, agent_calls):
     """개요 수집 미완료·clone 실패로 그래프가 비어도 호출 대상 구현은 보내야 한다."""
