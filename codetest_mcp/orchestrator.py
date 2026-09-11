@@ -447,6 +447,7 @@ def _to_report(
         test_file_path=execution.test_file_path,
         exit_code=execution.exit_code,
         output=execution.output,
+        build_errors=list(execution.build_errors),
     )
 
 
@@ -530,6 +531,7 @@ def report_execution(
         applied=list(execution.get("applied") or []),
         test_file_path=str(execution.get("test_file_path", "")),
         command=list(execution.get("command") or []),
+        build_errors=list(execution.get("build_errors") or []),
     )
     judged = _ask_agent_to_judge(project_id, facts, test_code, intent, intent_rationale)
     return _to_report(facts, judged, analysis, intent, intent_rationale)

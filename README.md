@@ -147,6 +147,11 @@ CLI 로 등록한 프로젝트가 그렇다. 이때는 서버에 git 이 있어�
 기능 중요도만 MCP 가 코드로 다시 판정한 뒤 결과 적절성을 Agent(LLM)에 묻는다.
 `diff` 를 함께 보내야 이번 실행 기준으로 등급 근거가 채워진다.
 
+`result` 는 **gradle 종료 코드**가 정한다 (`exit_code == 0` 이면 PASS). 컴파일이
+깨지면 테스트가 한 건도 안 돌아 `total/passed/failed` 가 전부 0 인 채로 FAIL 이
+되는데, 그 이유는 CLI 가 보내온 `build_errors` 에만 있다. 그래서 이 값은 리포트와
+Agent 프롬프트 양쪽에 그대로 싣는다 — 빼면 LLM 이 "실패 0건이니 통과" 로 읽는다.
+
 ```jsonc
 {
   // --- CLI 가 보내온 실행 사실 ---
@@ -155,6 +160,7 @@ CLI 로 등록한 프로젝트가 그렇다. 이때는 서버에 git 이 있어�
   "jacoco_enabled": true, "springboot_applied": true,
   "applied": ["@SpringBootTest 주입 (class GeneratedOrderTest)", "import 보강: …"],
   "test_file_path": "src/test/java/com/example/demo/GeneratedOrderTest.java",
+  "build_errors": [],   // 비어 있지 않으면 테스트가 시작조차 못한 것이다
 
   // --- MCP 가 코드로 확정한 사실 ---
   "importance": "MID", "importance_rationale": "- 영향도 점수 30점 → MID …",

@@ -412,6 +412,39 @@ async def test_report_forwards_the_execution_facts_to_the_agent(client, agent):
     assert execution["coverage"]["line_rate"] == 88.0
 
 
+async def test_build_errors_reach_the_report_and_the_agent(client, agent):
+    """컴파일이 깨지면 집계가 전부 0 이라 "실패 0건인데 FAIL" 로 읽힌다.
+
+    왜 FAIL 인지는 CLI 가 보내온 build_errors 에만 있으므로, 리포트에도
+    Agent 프롬프트에도 빠짐없이 실어야 한다.
+    """
+    project_id = await _register(client)
+    errors = ["FooTest.java:52: not a statement"]
+    body = await _call(
+        client, "report_execution", project_id=project_id,
+        execution={
+            **LOCAL_EXECUTION,
+            "exit_code": 1, "total": 0, "passed": 0, "failed": 0,
+            "failures": [], "build_errors": errors,
+        },
+        test_code="class FooTest {}", diff=DIFF,
+    )
+
+    assert body["result"] == "FAIL"
+    assert body["total"] == 0 and body["failed"] == 0
+    assert body["build_errors"] == errors
+    assert agent.last_report["execution"]["build_errors"] == errors
+
+
+async def test_a_normal_run_carries_no_build_errors(client, agent):
+    project_id = await _register(client)
+    body = await _call(
+        client, "report_execution", project_id=project_id,
+        execution=LOCAL_EXECUTION, test_code="class FooTest {}", diff=DIFF,
+    )
+    assert body["build_errors"] == []
+
+
 async def test_report_unknown_project_is_rejected(client, agent):
     with pytest.raises(ToolError, match="찾을 수 없습니다"):
         await _call(client, "report_execution", project_id="nope", execution=LOCAL_EXECUTION)

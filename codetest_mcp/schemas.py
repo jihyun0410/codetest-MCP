@@ -139,6 +139,9 @@ class ExecuteResponse(BaseModel):
     test_file_path: str = ""
     #: 실제 실행한 gradle 명령
     command: list[str] = Field(default_factory=list)
+    #: 테스트가 **시작조차 못한** 이유 (컴파일 오류 등). 테스트 실패와는 다르다.
+    #: 이게 차 있으면 total/passed/failed 가 전부 0 인 채로 FAIL 이 된다.
+    build_errors: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -220,3 +223,5 @@ class ReportResult(BaseModel):
     test_file_path: str = ""
     exit_code: int = 0
     output: str = ""
+    #: 테스트가 시작조차 못한 이유 (컴파일 오류 등) — "실패 0건인데 FAIL" 의 답
+    build_errors: list[str] = Field(default_factory=list)
