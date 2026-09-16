@@ -104,3 +104,60 @@ def test_report_uses_the_same_stream_path(monkeypatch):
     assert _client(monkeypatch, handler).report("p1", {"exit_code": 0}, "class T {}") == {
         "verdict": "적절"
     }
+
+
+# --- 응답 도중 연결이 끊긴 경우 ------------------------------------------------
+#
+# `RemoteProtocolError: peer closed connection without sending complete message
+# body (incomplete chunked read)` — 상대가 본문을 끝맺지 않고 닫았다는 뜻이다.
+# httpx 의 ConnectError 도 TimeoutException 도 아니라 따로 잡지 않으면 그대로
+# 새어 나가 CLI 에 파이썬 트레이스백이 찍힌다.
+CUT = httpx.RemoteProtocolError(
+    "peer closed connection without sending complete message body (incomplete chunked read)"
+)
+
+
+def _truncated(*messages: dict) -> httpx.Response:
+    """줄을 보낸 뒤 종료 청크 없이 끊기는 NDJSON 스트림."""
+    def _stream():
+        for message in messages:
+            yield (json.dumps(message, ensure_ascii=False) + "\n").encode()
+        raise CUT
+
+    return httpx.Response(200, headers={"content-type": NDJSON_MEDIA_TYPE}, content=_stream())
+
+
+def test_result_survives_a_stream_that_is_cut_after_the_result_line(monkeypatch):
+    """Agent 는 결과를 보낸 뒤 스트림을 닫는다 — 그 닫힘만 잘려도 결과는 살린다."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _truncated(
+            {"type": "ping"},
+            {"type": "result", "data": {"test_code": "class T {}"}},
+        )
+
+    assert _client(monkeypatch, handler).generate("p1", PAYLOAD["analysis"], []) == {
+        "test_code": "class T {}"
+    }
+
+
+def test_cut_before_any_result_becomes_a_readable_agent_error(monkeypatch):
+    """결과를 못 받았으면 트레이스백 대신 무엇을 확인할지 알려 준다."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _truncated({"type": "ping"})
+
+    with pytest.raises(AgentError) as exc:
+        _client(monkeypatch, handler).generate("p1", PAYLOAD["analysis"], [])
+
+    message = str(exc.value)
+    assert "연결을 끊었습니다" in message
+    assert "RemoteProtocolError" in message      # 원인을 지우지는 않는다
+    assert "proxy_read_timeout" in message       # 어디를 볼지 알려 준다
+
+
+def test_health_also_reports_a_cut_connection(monkeypatch):
+    """스트림이 아닌 호출도 같은 오류를 만난다 — 여기서도 새어 나가면 안 된다."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise CUT
+
+    with pytest.raises(AgentError, match="연결을 끊었습니다"):
+        _client(monkeypatch, handler).health()

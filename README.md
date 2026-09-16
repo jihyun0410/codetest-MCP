@@ -198,6 +198,24 @@ Accept 를 이해하지 못하는 예전 Agent 는 예전처럼 JSON 으로 답�
 (`CODETEST_MCP_AGENT_STREAM_IDLE`). 오래 걸리는 생성은 기다리고, 조용히 죽은
 Agent 는 2분 만에 포기한다.
 
+## RemoteProtocolError — 504 의 반대쪽 실패
+
+    RemoteProtocolError: peer closed connection without sending complete
+    message body (incomplete chunked read)
+
+504 가 "아무 말도 안 해서 끊긴" 것이라면, 이쪽은 **상대가 말하다 만 것**이다. 이 예외는
+httpx 의 `ConnectError` 도 `TimeoutException` 도 아니라서(`TransportError` 계열의
+`ProtocolError` 다) 예전에는 `agent_client` 의 except 를 모두 빠져나가 CLI 화면에
+파이썬 트레이스백 그대로 찍혔다. 이제 두 가지로 처리한다.
+
+**1. 이미 받은 결과는 살린다.** Agent 는 `result` 줄을 보낸 **뒤에** 스트림을 닫는데,
+그 마지막 닫힘만 앞단에서 잘리는 일이 있다. `_last_ndjson_result` 는 끊긴 시점에
+result/error 줄을 이미 받았으면 그것을 쓴다 — 끝난 생성을 실패로 보고하지 않는다.
+
+**2. 못 받았으면 볼 곳을 알려 준다.** 한 줄도 못 받고 끊겼으면 `AgentError` 로 바꿔
+Agent 프로세스(예외·OOM·재시작)·앞단 프록시·LLM 게이트웨이 중 어디를 봐야 하는지
+짚어 준다. 원인 예외 이름과 메시지는 그대로 붙인다.
+
 ## 실행
 
 ```bash

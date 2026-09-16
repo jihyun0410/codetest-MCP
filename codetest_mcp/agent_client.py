@@ -80,6 +80,8 @@ class AgentClient:
                 f"Agent 요청이 시간 초과되었습니다 ({timeout or self.timeout:.0f}s). "
                 "LLM 생성이 오래 걸리면 CODETEST_MCP_AGENT_GENERATE_TIMEOUT 를 늘리세요."
             ) from None
+        except httpx.TransportError as exc:
+            raise AgentError(_disconnected(exc, self.base_url)) from None
 
         if response.status_code >= 400:
             raise AgentError(_extract_detail(response), response.status_code)
@@ -129,6 +131,8 @@ class AgentClient:
                 "보내지 않았습니다. Agent 로그를 확인하세요 "
                 "(간격은 CODETEST_MCP_AGENT_STREAM_IDLE 로 조정)."
             ) from None
+        except httpx.TransportError as exc:
+            raise AgentError(_disconnected(exc, self.base_url)) from None
 
     # --- 헬스 ----------------------------------------------------------
     def health(self) -> dict:
@@ -175,21 +179,51 @@ class AgentClient:
         )
 
 
+def _disconnected(exc: httpx.TransportError, base_url: str) -> str:
+    """전송 도중 끊긴 경우의 안내문.
+
+    `RemoteProtocolError: peer closed connection without sending complete
+    message body (incomplete chunked read)` 는 "상대가 본문을 끝맺지 않고 연결을
+    닫았다" 는 뜻이다. httpx 의 ConnectError 도 TimeoutException 도 아니라서
+    따로 잡지 않으면 그대로 새어 나가 CLI 에 파이썬 트레이스백이 찍힌다.
+    """
+    return (
+        f"Agent 가 응답을 끝맺지 않고 연결을 끊었습니다: {base_url}\n"
+        f"  · Agent 프로세스가 처리 도중 죽었는지 로그를 확인하세요 "
+        f"(예외·OOM·uvicorn 재시작).\n"
+        f"  · 앞단 프록시(nginx/LB)가 끊었을 수 있습니다 — proxy_read_timeout 과 "
+        f"proxy_buffering off 를 확인하세요.\n"
+        f"  · Agent 가 LLM 게이트웨이에서 같은 오류를 만났을 수도 있습니다 — "
+        f"Agent 로그의 OpenAI 호출 부분을 함께 보세요.\n"
+        f"  ({type(exc).__name__}: {exc})"
+    )
+
+
 def _last_ndjson_result(response: httpx.Response) -> Any:
-    """ping 줄을 버리고 마지막 result/error 줄만 해석한다."""
+    """ping 줄을 버리고 마지막 result/error 줄만 해석한다.
+
+    스트림이 도중에 끊겨도 result/error 줄을 이미 받았다면 그것을 쓴다. Agent 는
+    결과를 보낸 **뒤** 스트림을 닫는데, 그 마지막 닫힘만 앞단에서 잘리는 일이
+    실제로 있다. 그때 받아 둔 결과까지 버리면 끝난 생성을 실패로 보고하게 된다.
+    """
     last: dict | None = None
-    for line in response.iter_lines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            message = json.loads(line)
-        except ValueError:
-            logger.debug("Agent 스트림에서 JSON 이 아닌 줄을 건너뜀: %.120s", line)
-            continue
-        if not isinstance(message, dict) or message.get("type") == "ping":
-            continue
-        last = message
+    try:
+        for line in response.iter_lines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except ValueError:
+                logger.debug("Agent 스트림에서 JSON 이 아닌 줄을 건너뜀: %.120s", line)
+                continue
+            if not isinstance(message, dict) or message.get("type") == "ping":
+                continue
+            last = message
+    except httpx.TransportError:
+        if last is None:
+            raise
+        logger.warning("Agent 스트림이 결과를 받은 뒤 끊겼습니다 — 받은 결과를 씁니다.")
 
     if last is None:
         raise AgentError("Agent 가 결과를 보내지 않고 응답을 끝냈습니다.")
