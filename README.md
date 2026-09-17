@@ -125,18 +125,38 @@ CLI 로 등록한 프로젝트가 그렇다. 이때는 서버에 git 이 있어�
 ### `prepare_test(project_id, test_code, base_package)`
 
 `codetest run` / `codetest test` **1단계**. `test_code` 에 `@SpringBootTest` 가 없으면
-주입하고, 필요한 import 와 `package` 선언도 보강한 뒤 `src/test/java/<package>/<Class>.java`
-저장 경로를 계산해 돌려준다. 문자열 변환뿐이라 git·JDK·Gradle 이 필요 없다.
+주입하고, 필요한 import 와 `package` 선언도 보강한 뒤
+`<테스트 소스 루트>/<package>/<Class>.java` 저장 경로를 계산해 돌려준다.
+문자열 변환뿐이라 git·JDK·Gradle 이 필요 없다.
 
 ```jsonc
 {
   "source": "package com.example.demo;\n\n@SpringBootTest\nclass GeneratedOrderTest { … }",
-  "file_path": "src/test/java/com/example/demo/GeneratedOrderTest.java",
+  "file_path": "api/src/test/java/com/example/demo/GeneratedOrderTest.java",
+  "test_root": "api/src/test/java",
   "class_name": "GeneratedOrderTest", "package": "com.example.demo",
   "springboot_applied": true,
   "applied": ["@SpringBootTest 주입 (class GeneratedOrderTest)", "import 보강: …"]
 }
 ```
+
+**테스트 소스 루트를 상수로 두지 않는다.** `src/test/java` 는 단일 모듈이 저장소
+루트에 있을 때만 맞는다. `springboot.detect_layout` 이 개요에 저장된 **실제 소스
+경로에서** 모듈 접두사를 읽어 만든다.
+
+| 개요에 담긴 경로 | base_package | test_root |
+|---|---|---|
+| `src/main/java/com/example/demo/App.java` | `com.example.demo` | `src/test/java` |
+| `api/src/main/java/com/example/api/App.java` | `com.example.api` | `api/src/test/java` |
+| `services/core/src/main/kotlin/com/acme/core/App.kt` | `com.acme.core` | `services/core/src/test/java` |
+
+모듈이 여럿이면 **가장 짧은(=최상위) 패키지**를 가진 모듈을 기준으로 삼는다.
+테스트 언어 디렉터리는 main 이 Kotlin 이어도 `java` 다 — 생성물이 Java 이고 Gradle 의
+java 플러그인도 Maven 의 기본 `testSourceDirectory` 도 그 경로를 컴파일한다.
+
+> 이 서버에는 사용자의 작업 트리가 없으므로 여기서 나온 경로는 **추정**이다. CLI 가
+> 자기 파일 시스템을 보고 최종 확인한다 (codereview_gitver `project_layout.py`) —
+> 멀티 모듈·Maven·저장소 하위 빌드 루트는 그쪽에서 정해진다.
 
 주석·문자열 안의 `@SpringBootTest` 는 주입 여부 판정에서 제외한다. 주석으로 적어 둔
 한 줄 때문에 실제 주입이 건너뛰어지면 테스트가 Spring 컨텍스트 없이 돌아 깨진다.
@@ -198,6 +218,24 @@ Accept 를 이해하지 못하는 예전 Agent 는 예전처럼 JSON 으로 답�
 (`CODETEST_MCP_AGENT_STREAM_IDLE`). 오래 걸리는 생성은 기다리고, 조용히 죽은
 Agent 는 2분 만에 포기한다.
 
+## RemoteProtocolError — 504 의 반대쪽 실패
+
+    RemoteProtocolError: peer closed connection without sending complete
+    message body (incomplete chunked read)
+
+504 가 "아무 말도 안 해서 끊긴" 것이라면, 이쪽은 **상대가 말하다 만 것**이다. 이 예외는
+httpx 의 `ConnectError` 도 `TimeoutException` 도 아니라서(`TransportError` 계열의
+`ProtocolError` 다) 예전에는 `agent_client` 의 except 를 모두 빠져나가 CLI 화면에
+파이썬 트레이스백 그대로 찍혔다. 이제 두 가지로 처리한다.
+
+**1. 이미 받은 결과는 살린다.** Agent 는 `result` 줄을 보낸 **뒤에** 스트림을 닫는데,
+그 마지막 닫힘만 앞단에서 잘리는 일이 있다. `_last_ndjson_result` 는 끊긴 시점에
+result/error 줄을 이미 받았으면 그것을 쓴다 — 끝난 생성을 실패로 보고하지 않는다.
+
+**2. 못 받았으면 볼 곳을 알려 준다.** 한 줄도 못 받고 끊겼으면 `AgentError` 로 바꿔
+Agent 프로세스(예외·OOM·재시작)·앞단 프록시·LLM 게이트웨이 중 어디를 봐야 하는지
+짚어 준다. 원인 예외 이름과 메시지는 그대로 붙인다.
+
 ## 실행
 
 ```bash
@@ -233,9 +271,10 @@ export CODETEST_API_KEY="…"        # CODETEST_MCP_API_KEYS 중 하나
 API Key 는 **http 전송일 때만** 검사한다 (`X-API-Key` 헤더). stdio 는 CLI 가 이
 서버를 자식 프로세스로 띄운 것이라 신뢰 경계가 아니다.
 
-`gradlew` 선택과 JaCoCo 커버리지 수집은 실행을 맡은 **CLI 쪽 관심사**다
-(`codereview_gitver/local-client/codetest/executor.py`). 커버리지는 개발자 프로젝트
-`build.gradle` 에 `jacoco` 플러그인이 적용되어 있을 때만 붙는다.
+빌드 도구 선택(Gradle/Maven)·모듈 결정·`gradlew` 선택과 JaCoCo 커버리지 수집은
+실행을 맡은 **CLI 쪽 관심사**다
+(`codereview_gitver/local-client/codetest/project_layout.py`). 커버리지는 개발자
+프로젝트의 `build.gradle` / `pom.xml` 에 `jacoco` 가 적용되어 있을 때만 붙는다.
 
 ## 테스트
 

@@ -13,7 +13,14 @@ Agent(LLM)가 만든 Java 테스트 소스를 받아 **결정적인 문자열 �
   1. package 선언 확인 — 없으면 프로젝트의 기준 패키지를 넣는다
   2. 테스트 클래스에 @SpringBootTest 가 없으면 붙인다
   3. @SpringBootTest / @Test 에 필요한 import 를 보강한다
-  4. 저장 경로(src/test/java/<package>/<Class>.java)를 계산한다
+  4. 저장 경로(<테스트 소스 루트>/<package>/<Class>.java)를 계산한다
+
+**저장 경로를 못 박지 않는다.** 예전에는 `src/test/java/…` 를 상수로 썼는데, 그건
+단일 모듈이 저장소 루트에 있을 때만 맞는다. 멀티 모듈(`api/`, `batch/`)에서는
+`api/src/test/java/…` 여야 한다. `detect_layout` 이 **실제 소스 경로에서** 모듈
+접두사를 읽어 테스트 루트를 만든다. 이 서버에는 사용자의 작업 트리가 없으므로
+여기서 나온 값은 **추정**이고, 최종 확인은 파일 시스템을 가진 CLI 가 한다
+(codereview_gitver `project_layout.py`).
 """
 
 from __future__ import annotations
@@ -23,6 +30,16 @@ from dataclasses import dataclass, field
 
 #: Spring Boot 테스트 컨텍스트 애너테이션
 SPRING_BOOT_TEST = "@SpringBootTest"
+
+#: 모듈을 못 찾았을 때 쓰는 표준 레이아웃
+DEFAULT_TEST_ROOT = "src/test/java"
+#: 생성물은 Java 다 — Gradle 의 java 플러그인도 Maven 의 testSourceDirectory 도
+#: 이 디렉터리를 컴파일하므로 Kotlin 프로젝트에서도 여기에 둔다.
+_TEST_LANGUAGE = "java"
+#: `api/src/main/java/com/example/demo/Foo.java` 를 모듈·종류·언어·나머지로 가른다
+_SOURCE_ROOT_RE = re.compile(
+    r"^(?P<module>(?:.*/)?)src/(?P<kind>main|test)/(?P<lang>java|kotlin|groovy)/(?P<tail>.+)$"
+)
 
 _IMPORT_SPRING_BOOT_TEST = "org.springframework.boot.test.context.SpringBootTest"
 _IMPORT_JUNIT_TEST = "org.junit.jupiter.api.Test"
@@ -62,8 +79,10 @@ class PreparedTest:
     source: str
     class_name: str
     package: str
-    #: 저장소 루트 기준 상대 경로 (예: src/test/java/com/example/demo/FooTest.java)
+    #: 저장소 루트 기준 상대 경로 (예: api/src/test/java/com/example/demo/FooTest.java)
     file_path: str
+    #: 그 경로를 만든 테스트 소스 루트 (예: api/src/test/java)
+    test_root: str = DEFAULT_TEST_ROOT
     #: 이번 변환에서 실제로 무엇을 했는지 (리포트에 근거로 남긴다)
     applied: list[str] = field(default_factory=list)
 
@@ -72,13 +91,19 @@ class PreparedTest:
         return SPRING_BOOT_TEST in _code_only(self.source)
 
 
-def prepare(test_code: str, base_package: str | None = None) -> PreparedTest:
+def prepare(
+    test_code: str,
+    base_package: str | None = None,
+    test_root: str | None = None,
+) -> PreparedTest:
     """
     테스트 소스에 @SpringBootTest 를 보장하고 저장 경로를 계산한다.
 
     :param test_code:     Agent(LLM)가 생성한 Java 테스트 소스
     :param base_package:  package 선언이 없을 때 사용할 기준 패키지
                           (프로젝트 개요에서 얻은 @SpringBootApplication 패키지)
+    :param test_root:     테스트 소스 루트 (예: `api/src/test/java`).
+                          생략하면 표준 단일 모듈 레이아웃으로 본다.
     """
     source = (test_code or "").strip()
     applied: list[str] = []
@@ -105,18 +130,16 @@ def prepare(test_code: str, base_package: str | None = None) -> PreparedTest:
     if added_imports:
         applied.append("import 보강: " + ", ".join(added_imports))
 
+    root = (test_root or DEFAULT_TEST_ROOT).replace("\\", "/").strip("/") or DEFAULT_TEST_ROOT
     package_path = package.replace(".", "/")
-    file_path = (
-        f"src/test/java/{package_path}/{class_name}.java"
-        if package_path
-        else f"src/test/java/{class_name}.java"
-    )
+    file_path = f"{root}/{package_path}/{class_name}.java" if package_path else f"{root}/{class_name}.java"
 
     return PreparedTest(
         source=source,
         class_name=class_name,
         package=package,
         file_path=file_path,
+        test_root=root,
         applied=applied,
     )
 
@@ -180,24 +203,61 @@ def _covered(existing: set[str], target: str) -> bool:
     return wildcard in existing
 
 
-def detect_base_package(source_paths: list[str]) -> str | None:
-    """
-    프로젝트의 기준 패키지를 경로에서 추론한다.
+# ---------------------------------------------------------------------------
+#  레이아웃 추론 (폴더 구조를 못 박지 않기 위한 부분)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class SourceLayout:
+    """소스 경로에서 읽어 낸 프로젝트 레이아웃."""
 
-    src/main/java/com/example/demo/DemoApplication.java → com.example.demo
-    가장 짧은(=최상위) 패키지를 기준으로 삼는다.
+    #: @SpringBootApplication 이 있을 최상위 패키지 (없으면 None)
+    base_package: str | None = None
+    #: 그 패키지가 속한 모듈의 테스트 소스 루트 (예: `api/src/test/java`)
+    test_root: str = DEFAULT_TEST_ROOT
+    #: 모듈 접두사 (`api/`, 단일 모듈이면 `""`)
+    module: str = ""
+
+
+def detect_layout(source_paths: list[str]) -> SourceLayout:
     """
-    candidates: list[str] = []
-    for path in source_paths:
-        normalized = path.replace("\\", "/")
-        marker = "src/main/java/"
-        if marker not in normalized or not normalized.endswith(".java"):
+    소스 경로에서 기준 패키지와 테스트 소스 루트를 함께 추론한다.
+
+        src/main/java/com/example/demo/DemoApplication.java
+          → com.example.demo / src/test/java
+
+        api/src/main/kotlin/com/example/api/ApiApplication.kt
+          → com.example.api / api/src/test/java
+
+    모듈이 여럿이면 **가장 짧은(=최상위) 패키지**를 가진 모듈을 기준으로 삼는다.
+    그 패키지가 애플리케이션 루트일 가능성이 가장 높고, 예전 동작과도 같다.
+    테스트 언어 디렉터리는 main 이 Kotlin 이어도 `java` 다 — 생성물이 Java 이고
+    두 빌드 도구 모두 그 경로를 컴파일한다.
+    """
+    candidates: list[tuple[str, str]] = []      # (패키지, 모듈 접두사)
+    fallback: list[tuple[str, str]] = []        # main 이 없을 때 쓸 test 쪽 후보
+
+    for path in source_paths or []:
+        match = _SOURCE_ROOT_RE.match(path.replace("\\", "/").lstrip("./"))
+        if match is None:
             continue
-        tail = normalized.split(marker, 1)[1]
-        parts = tail.split("/")[:-1]  # 파일명 제외
-        if parts:
-            candidates.append(".".join(parts))
+        parts = match.group("tail").split("/")[:-1]     # 파일명 제외
+        if not parts:
+            continue
+        entry = (".".join(parts), match.group("module"))
+        (candidates if match.group("kind") == "main" else fallback).append(entry)
 
-    if not candidates:
-        return None
-    return min(candidates, key=lambda value: (value.count("."), len(value)))
+    chosen = candidates or fallback
+    if not chosen:
+        return SourceLayout()
+
+    package, module = min(chosen, key=lambda item: (item[0].count("."), len(item[0])))
+    return SourceLayout(
+        base_package=package,
+        test_root=f"{module}src/test/{_TEST_LANGUAGE}",
+        module=module,
+    )
+
+
+def detect_base_package(source_paths: list[str]) -> str | None:
+    """기준 패키지만 필요할 때 쓰는 단축 경로."""
+    return detect_layout(source_paths).base_package

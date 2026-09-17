@@ -182,10 +182,14 @@ class PreparedTestResponse(BaseModel):
     project_id: str
     #: package/import/@SpringBootTest 를 보강한 최종 Java 소스
     source: str
-    #: 저장소 루트 기준 상대 경로 (예: src/test/java/com/example/demo/FooTest.java)
+    #: 저장소 루트 기준 상대 경로 (예: api/src/test/java/com/example/demo/FooTest.java)
+    #: 멀티 모듈이면 모듈 접두사가 붙는다. CLI 는 이것을 **단서로만** 쓰고 자기
+    #: 파일 시스템에서 실제 자리를 다시 확인한다.
     file_path: str
     class_name: str
     package: str
+    #: 그 경로를 만든 테스트 소스 루트 (예: api/src/test/java)
+    test_root: str = "src/test/java"
     springboot_applied: bool = False
     #: 실제로 수행한 변환 목록 (리포트에 근거로 남는다)
     applied: list[str] = Field(default_factory=list)
