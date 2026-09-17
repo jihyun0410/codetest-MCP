@@ -116,6 +116,67 @@ def test_detect_base_package_ignores_non_java_sources():
     assert springboot.detect_base_package(["build.gradle", "README.md"]) is None
 
 
+# --- 폴더 구조를 못 박지 않는다 --------------------------------------------------
+#
+# `src/test/java` 를 상수로 쓰면 단일 모듈이 저장소 루트에 있을 때만 맞는다.
+# 멀티 모듈에서는 대상 코드와 같은 모듈에 테스트가 들어가야 한다.
+def test_single_module_layout_is_unchanged():
+    layout = springboot.detect_layout(["src/main/java/com/example/demo/DemoApplication.java"])
+
+    assert layout.base_package == "com.example.demo"
+    assert layout.test_root == "src/test/java"
+    assert layout.module == ""
+
+
+def test_multi_module_keeps_the_module_prefix():
+    layout = springboot.detect_layout([
+        "api/src/main/java/com/example/api/ApiApplication.java",
+        "batch/src/main/java/com/example/batch/job/DailyJob.java",
+    ])
+
+    # 가장 짧은(=최상위) 패키지를 가진 모듈이 기준이다
+    assert layout.base_package == "com.example.api"
+    assert layout.test_root == "api/src/test/java"
+    assert layout.module == "api/"
+
+
+def test_nested_module_paths_are_kept_whole():
+    layout = springboot.detect_layout(["services/core/src/main/java/com/acme/core/Core.java"])
+    assert layout.test_root == "services/core/src/test/java"
+
+
+def test_kotlin_sources_still_map_to_a_java_test_root():
+    """생성물은 Java 다 — Gradle 의 java 플러그인도 Maven 도 그 경로를 컴파일한다."""
+    layout = springboot.detect_layout(["api/src/main/kotlin/com/example/api/App.kt"])
+
+    assert layout.base_package == "com.example.api"
+    assert layout.test_root == "api/src/test/java"
+
+
+def test_test_sources_are_used_when_there_is_no_main():
+    layout = springboot.detect_layout(["api/src/test/java/com/example/api/ExistingTest.java"])
+    assert layout.test_root == "api/src/test/java"
+
+
+def test_layout_falls_back_to_the_standard_paths():
+    layout = springboot.detect_layout(["build.gradle", "README.md"])
+
+    assert layout.base_package is None
+    assert layout.test_root == springboot.DEFAULT_TEST_ROOT
+
+
+def test_prepare_puts_the_test_in_the_given_module():
+    prepared = springboot.prepare(PLAIN_TEST, test_root="api/src/test/java")
+
+    assert prepared.file_path == "api/src/test/java/com/example/demo/OrderServiceTest.java"
+    assert prepared.test_root == "api/src/test/java"
+
+
+def test_prepare_normalizes_a_windows_style_test_root():
+    prepared = springboot.prepare(PLAIN_TEST, test_root="api\\src\\test\\java/")
+    assert prepared.file_path == "api/src/test/java/com/example/demo/OrderServiceTest.java"
+
+
 # --- 주석에 속지 않아야 한다 ---------------------------------------------------
 def test_comment_mentioning_the_annotation_does_not_block_injection():
     """설명 주석에 @SpringBootTest 가 적혀 있다고 주입을 건너뛰면

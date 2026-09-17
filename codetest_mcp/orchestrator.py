@@ -91,8 +91,13 @@ def _snapshot(project_id: str) -> ProjectSnapshot:
         )
 
 
-def project_base_package(db: Session, project_id: str) -> str | None:
-    """저장된 그래프의 파일 경로에서 기준 패키지를 추론한다."""
+def project_source_layout(db: Session, project_id: str) -> springboot.SourceLayout:
+    """저장된 그래프의 파일 경로에서 기준 패키지와 테스트 소스 루트를 추론한다.
+
+    폴더 구조를 못 박지 않기 위한 부분이다 — 멀티 모듈이면 테스트 루트에 모듈
+    접두사가 붙는다 (`api/src/test/java`). 이 서버에는 사용자의 작업 트리가 없어
+    여기서 나온 값은 추정이고, CLI 가 자기 파일 시스템으로 최종 확인한다.
+    """
     paths = list(
         db.scalars(
             select(GraphNode.file_path).where(
@@ -101,7 +106,12 @@ def project_base_package(db: Session, project_id: str) -> str | None:
             )
         )
     )
-    return springboot.detect_base_package(paths)
+    return springboot.detect_layout(paths)
+
+
+def project_base_package(db: Session, project_id: str) -> str | None:
+    """기준 패키지만 필요할 때 쓰는 단축 경로."""
+    return project_source_layout(db, project_id).base_package
 
 
 def as_pairs(sources) -> list[tuple[str, str]]:
@@ -476,15 +486,16 @@ def prepare_test(
     if not test_code.strip():
         raise FlowError("실행할 Test Code 가 비어 있습니다.")
 
-    if base_package is None:
-        with session_scope() as db:
-            project_or_fail(db, project_id)
-            base_package_hint = project_base_package(db, project_id)
-    else:
-        base_package_hint = base_package
+    # 기준 패키지는 호출자가 줄 수 있지만 **테스트 소스 루트는 언제나 개요에서**
+    # 읽는다. 멀티 모듈이면 `api/src/test/java` 처럼 모듈 접두사가 붙어야 한다.
+    with session_scope() as db:
+        project_or_fail(db, project_id)
+        layout = project_source_layout(db, project_id)
+
+    base_package_hint = layout.base_package if base_package is None else base_package
 
     try:
-        prepared = springboot.prepare(test_code, base_package_hint)
+        prepared = springboot.prepare(test_code, base_package_hint, layout.test_root)
     except ValueError as exc:
         raise FlowError(str(exc)) from None
 
@@ -494,6 +505,7 @@ def prepare_test(
         file_path=prepared.file_path,
         class_name=prepared.class_name,
         package=prepared.package,
+        test_root=prepared.test_root,
         springboot_applied=prepared.springboot_applied,
         applied=list(prepared.applied),
     )
