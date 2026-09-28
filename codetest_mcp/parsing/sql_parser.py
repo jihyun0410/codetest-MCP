@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 
 from codetest_mcp.db import EdgeType, NodeType
-from codetest_mcp.parsing.base import ParsedEdge, ParsedNode, ParseResult
+from codetest_mcp.parsing.base import ParseResult, ParsedEdge, ParsedNode, extract_tables
 
 LANGUAGE = "sql"
 
@@ -58,7 +58,7 @@ class SqlParser:
                     meta={
                         "origin": "sql-file",
                         "operation": _operation(statement),
-                        "tables": _extract_tables(statement),
+                        "tables": extract_tables(statement),
                     },
                 )
             )
@@ -124,13 +124,3 @@ def _signature(sql: str, limit: int = 160) -> str:
     one_line = re.sub(r"\s+", " ", sql).strip()
     return one_line[:limit] + ("…" if len(one_line) > limit else "")
 
-
-def _extract_tables(sql: str) -> list[str]:
-    pattern = re.compile(
-        r"\b(?:FROM|JOIN|INTO|UPDATE)\s+([A-Za-z_][A-Za-z0-9_\.]*)", re.IGNORECASE
-    )
-    seen: list[str] = []
-    for name in pattern.findall(sql):
-        if name.lower() not in {t.lower() for t in seen}:
-            seen.append(name)
-    return seen

@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 
 from codetest_mcp.db import EdgeType, NodeType
-from codetest_mcp.parsing.base import ParsedEdge, ParsedNode, ParseResult
+from codetest_mcp.parsing.base import ParseResult, ParsedEdge, ParsedNode, extract_tables, join_route
 from codetest_mcp.parsing.tree_sitter_loader import (
     child_by_field,
     field_text,
@@ -307,7 +307,7 @@ def _parse_method(
     for ann in annotations:
         if ann["name"] in _HTTP_MAPPINGS:
             http_method = _HTTP_MAPPINGS[ann["name"]]
-            route = _join_route(class_route, _extract_route(ann["args"]))
+            route = join_route(class_route, _extract_route(ann["args"]))
     is_entrypoint = bool(http_method) or (
         is_endpoint_class and method_name.lower() in {"handle", "index"}
     )
@@ -361,7 +361,7 @@ def _parse_method(
                 meta={
                     "origin": "annotation",
                     "annotation": ann["name"],
-                    "tables": _extract_tables(sql_text),
+                    "tables": extract_tables(sql_text),
                     "operation": _sql_operation(sql_text),
                 },
             )
@@ -470,7 +470,7 @@ def _parse_method(
                         body=literal,
                         meta={
                             "origin": "inline",
-                            "tables": _extract_tables(literal),
+                            "tables": extract_tables(literal),
                             "operation": _sql_operation(literal),
                         },
                     )
@@ -557,13 +557,6 @@ def _extract_route(args: str) -> str:
     return match.group(1) if match else ""
 
 
-def _join_route(base: str, sub: str) -> str:
-    if not base:
-        return sub
-    if not sub:
-        return base
-    return f"{base.rstrip('/')}/{sub.lstrip('/')}"
-
 
 def _extract_string_literal(args: str) -> str | None:
     """애노테이션 인자에서 (여러 조각으로 나뉜) 문자열 리터럴을 이어 붙인다."""
@@ -579,18 +572,6 @@ def _sql_operation(sql: str) -> str:
     match = _SQL_KEYWORD.search(sql)
     return match.group(1).upper() if match else "UNKNOWN"
 
-
-def _extract_tables(sql: str) -> list[str]:
-    """FROM / JOIN / INTO / UPDATE 뒤의 테이블명을 추출한다."""
-    pattern = re.compile(
-        r"\b(?:FROM|JOIN|INTO|UPDATE)\s+([A-Za-z_][A-Za-z0-9_\.]*)", re.IGNORECASE
-    )
-    seen: list[str] = []
-    for name in pattern.findall(sql):
-        lowered = name.lower()
-        if lowered not in {t.lower() for t in seen}:
-            seen.append(name)
-    return seen
 
 
 def _sql_signature(sql: str, limit: int = 160) -> str:

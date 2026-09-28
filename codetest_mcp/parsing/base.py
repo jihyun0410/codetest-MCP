@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import re
+
 import hashlib
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -70,11 +72,40 @@ class ParseResult:
     #: 파싱 실패/부분 실패 사유
     warnings: list[str] = field(default_factory=list)
 
-    def merge(self, other: "ParseResult") -> None:
+    def merge(self, other: ParseResult) -> None:
         self.nodes.extend(other.nodes)
         self.edges.extend(other.edges)
         self.frameworks |= other.frameworks
         self.warnings.extend(other.warnings)
+
+
+#: FROM / JOIN / INTO / UPDATE 뒤의 테이블명
+_TABLE_RE = re.compile(
+    r"\b(?:FROM|JOIN|INTO|UPDATE)\s+([A-Za-z_][A-Za-z0-9_\.]*)", re.IGNORECASE
+)
+
+
+def extract_tables(sql: str) -> list[str]:
+    """SQL 에서 참조하는 테이블명을 등장 순서대로, 중복 없이 뽑는다.
+
+    Java 인라인 SQL · MyBatis XML · .sql 파일 세 파서가 똑같이 쓰던 함수다.
+    """
+    seen: list[str] = []
+    lowered: set[str] = set()
+    for name in _TABLE_RE.findall(sql):
+        if name.lower() not in lowered:
+            lowered.add(name.lower())
+            seen.append(name)
+    return seen
+
+
+def join_route(base: str, sub: str) -> str:
+    """클래스 수준 경로와 메서드 수준 경로를 이어 붙인다 (`/a` + `b` → `/a/b`)."""
+    if not base:
+        return sub
+    if not sub:
+        return base
+    return f"{base.rstrip('/')}/{sub.lstrip('/')}"
 
 
 class LanguageParser(Protocol):

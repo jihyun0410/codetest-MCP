@@ -69,16 +69,11 @@ class AgentClient:
             with httpx.Client(timeout=timeout or self.timeout) as client:
                 response = client.request(method, url, headers=self._headers(), **kwargs)
         except httpx.ConnectError as exc:
-            raise AgentError(
-                f"Agent 에 연결할 수 없습니다: {self.base_url}\n"
-                f"  · Agent 가 실행 중인지 확인하세요 (uvicorn app.main:app).\n"
-                f"  · CODETEST_MCP_AGENT_BASE_URL 환경변수로 주소를 바꿀 수 있습니다.\n"
-                f"  ({exc})"
-            ) from None
+            raise AgentError(_unreachable(exc, self.base_url)) from None
         except httpx.TimeoutException:
             raise AgentError(
                 f"Agent 요청이 시간 초과되었습니다 ({timeout or self.timeout:.0f}s). "
-                "LLM 생성이 오래 걸리면 CODETEST_MCP_AGENT_GENERATE_TIMEOUT 를 늘리세요."
+                "CODETEST_MCP_AGENT_TIMEOUT 로 늘릴 수 있습니다."
             ) from None
         except httpx.TransportError as exc:
             raise AgentError(_disconnected(exc, self.base_url)) from None
@@ -119,12 +114,7 @@ class AgentClient:
                     return response.json() if response.content else None
                 return _last_ndjson_result(response)
         except httpx.ConnectError as exc:
-            raise AgentError(
-                f"Agent 에 연결할 수 없습니다: {self.base_url}\n"
-                f"  · Agent 가 실행 중인지 확인하세요 (uvicorn app.main:app).\n"
-                f"  · CODETEST_MCP_AGENT_BASE_URL 환경변수로 주소를 바꿀 수 있습니다.\n"
-                f"  ({exc})"
-            ) from None
+            raise AgentError(_unreachable(exc, self.base_url)) from None
         except httpx.TimeoutException:
             raise AgentError(
                 f"Agent 가 {settings.agent_stream_idle_seconds:.0f}초 동안 아무 응답도 "
@@ -177,6 +167,16 @@ class AgentClient:
                 "intent_rationale": intent_rationale,
             },
         )
+
+
+def _unreachable(exc: httpx.ConnectError, base_url: str) -> str:
+    """요청이 Agent 에 닿지도 못한 경우의 안내문."""
+    return (
+        f"Agent 에 연결할 수 없습니다: {base_url}\n"
+        f"  · Agent 가 실행 중인지 확인하세요 (uvicorn app.main:app).\n"
+        f"  · CODETEST_MCP_AGENT_BASE_URL 환경변수로 주소를 바꿀 수 있습니다.\n"
+        f"  ({exc})"
+    )
 
 
 def _disconnected(exc: httpx.TransportError, base_url: str) -> str:

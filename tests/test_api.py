@@ -19,7 +19,6 @@ from codetest_mcp.config import settings
 from codetest_mcp.db import Base
 from codetest_mcp.main import mcp
 from codetest_mcp.schemas import SourceFilePayload
-from codetest_mcp.springboot import PreparedTest
 
 ORDER_PATH = "src/main/java/com/example/demo/service/OrderService.java"
 

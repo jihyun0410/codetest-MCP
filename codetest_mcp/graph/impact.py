@@ -210,9 +210,11 @@ class ImpactAnalyzer:
             neighbours: list[tuple[GraphEdge, str]] = [
                 (edge, edge.source_id) for edge in self._incoming.get(node_id, [])
             ]
-            for edge in self._outgoing.get(node_id, []):
-                if edge.edge_type in {EdgeType.EXECUTES.value, EdgeType.CONTAINS.value}:
-                    neighbours.append((edge, edge.target_id))
+            neighbours.extend(
+                (edge, edge.target_id)
+                for edge in self._outgoing.get(node_id, [])
+                if edge.edge_type in {EdgeType.EXECUTES.value, EdgeType.CONTAINS.value}
+            )
 
             for edge, neighbour_id in neighbours:
                 if neighbour_id in visited:

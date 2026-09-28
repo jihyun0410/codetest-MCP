@@ -85,7 +85,7 @@ def _parse_with_tree_sitter(parser, file_path: str, source: str) -> ParseResult:
         elif real.type == "function_definition" and not _inside_class(real):
             name = field_text(real, "name", src) or "anonymous"
             _emit_function_ts(
-                real, decorators, src, file_path, module,
+                real, decorators, src, file_path,
                 f"{module}::{name}", name, file_qname, result,
             )
 
@@ -143,12 +143,12 @@ def _emit_class_ts(node, decorators, src, file_path, module, file_qname, result)
             continue
         mname = field_text(real, "name", src) or "anonymous"
         _emit_function_ts(
-            real, decos, src, file_path, module, f"{qname}.{mname}", mname, qname, result
+            real, decos, src, file_path, f"{qname}.{mname}", mname, qname, result
         )
 
 
 def _emit_function_ts(
-    node, decorators, src, file_path, module, qname, name, parent_qname, result
+    node, decorators, src, file_path, qname, name, parent_qname, result
 ) -> None:
     params = field_text(node, "parameters", src) or "()"
     deco_texts = [node_text(d, src) for d in decorators]
