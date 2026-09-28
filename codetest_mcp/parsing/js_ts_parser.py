@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 
 from codetest_mcp.db import EdgeType, NodeType
-from codetest_mcp.parsing.base import ParsedEdge, ParsedNode, ParseResult
+from codetest_mcp.parsing.base import ParseResult, ParsedEdge, ParsedNode, join_route
 from codetest_mcp.parsing.tree_sitter_loader import (
     child_by_field,
     field_text,
@@ -123,7 +123,7 @@ def _parse_with_tree_sitter(parser, file_path: str, source: str, language: str) 
         if node.type in _FUNC_DECLS and not _is_inside_class(node):
             name = field_text(node, "name", src) or "anonymous"
             _emit_function(
-                node, src, file_path, module, f"{module}::{name}", name,
+                node, src, file_path, f"{module}::{name}", name,
                 file_qname, language, result, is_route_file,
             )
         elif node.type == "variable_declarator":
@@ -132,7 +132,7 @@ def _parse_with_tree_sitter(parser, file_path: str, source: str, language: str) 
                 continue
             name = field_text(node, "name", src) or "anonymous"
             _emit_function(
-                value, src, file_path, module, f"{module}::{name}", name,
+                value, src, file_path, f"{module}::{name}", name,
                 file_qname, language, result, is_route_file,
             )
 
@@ -174,7 +174,7 @@ def _parse_class(node, src, file_path, module, file_qname, language, result: Par
         if member.type == "method_definition":
             mname = field_text(member, "name", src) or "anonymous"
             _emit_function(
-                member, src, file_path, module, f"{class_qname}.{mname}", mname,
+                member, src, file_path, f"{class_qname}.{mname}", mname,
                 class_qname, language, result, False, class_route=class_route,
             )
         elif member.type in {"public_field_definition", "field_definition", "property_signature"}:
@@ -200,7 +200,7 @@ def _parse_class(node, src, file_path, module, file_qname, language, result: Par
 
 
 def _emit_function(
-    node, src, file_path, module, qname, name, parent_qname, language,
+    node, src, file_path, qname, name, parent_qname, language,
     result: ParseResult, is_route_file: bool, class_route: str = "",
 ) -> None:
     """함수/메서드 노드 1개와 그 본문에서 파생되는 간선을 만든다."""
@@ -210,7 +210,7 @@ def _emit_function(
     http_method = next(
         (d["name"].upper() for d in decorators if d["name"] in _NEST_DECORATORS), None
     )
-    route = _join_route(class_route, _decorator_route(decorators, _NEST_DECORATORS))
+    route = join_route(class_route, _decorator_route(decorators, _NEST_DECORATORS))
 
     is_entrypoint = bool(http_method) or (
         is_route_file and name.upper() in {"GET", "POST", "PUT", "DELETE", "PATCH", "HANDLER", "DEFAULT"}
@@ -332,13 +332,6 @@ def _first_string_literal(node, src) -> str | None:
             return node_text(child, src).strip("`'\"")
     return None
 
-
-def _join_route(base: str, sub: str) -> str:
-    if not base:
-        return sub
-    if not sub:
-        return base
-    return f"{base.rstrip('/')}/{sub.lstrip('/')}"
 
 
 def _module_id(file_path: str) -> str:

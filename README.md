@@ -216,7 +216,7 @@ Accept 를 이해하지 못하는 예전 Agent 는 예전처럼 JSON 으로 답�
 
 그래서 타임아웃 설정도 총 시간이 아니라 무응답 시간으로 바꿨다
 (`CODETEST_MCP_AGENT_STREAM_IDLE`). 오래 걸리는 생성은 기다리고, 조용히 죽은
-Agent 는 2분 만에 포기한다.
+Agent 는 3분 만에 포기한다.
 
 ## RemoteProtocolError — 504 의 반대쪽 실패
 
@@ -261,8 +261,8 @@ export CODETEST_API_KEY="…"        # CODETEST_MCP_API_KEYS 중 하나
 | `CODETEST_MCP_TRANSPORT` | `streamable-http` | `streamable-http` 또는 `stdio` |
 | `CODETEST_MCP_AGENT_URL` | `http://localhost:8000` | Agent(LLM 판단) FastAPI 주소 |
 | `CODETEST_MCP_AGENT_API_KEY` | (없음) | Agent 가 요구하는 `X-API-Key` |
-| `CODETEST_MCP_AGENT_TIMEOUT` | `60` | Agent 일반 요청(헬스 등) 대기 시간(초) |
-| `CODETEST_MCP_AGENT_STREAM_IDLE` | `120` | LLM 호출의 **무응답** 상한(초). 총 소요 시간이 아니다 |
+| `CODETEST_MCP_AGENT_TIMEOUT` | `180` | Agent 일반 요청(헬스 등) 대기 시간(초) |
+| `CODETEST_MCP_AGENT_STREAM_IDLE` | `180` | LLM 호출의 **무응답** 상한(초). 총 소요 시간이 아니다 |
 | `CODETEST_MCP_PORT` | `80` | 수신 포트. root 아니면 `8100` 등으로 바꿀 것 |
 | `CODETEST_MCP_API_KEYS` | (없음) | Agent 인증 키(CSV). 비우면 인증 비활성화 |
 | `CODETEST_MCP_DATABASE_URL` | `sqlite:///./data/codetest_mcp.db` | 개요/그래프 저장소 |

@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 
 from codetest_mcp.db import EdgeType, NodeType
-from codetest_mcp.parsing.base import ParsedEdge, ParsedNode, ParseResult
+from codetest_mcp.parsing.base import ParseResult, ParsedEdge, ParsedNode, extract_tables
 
 LANGUAGE = "xml"
 
@@ -79,7 +79,7 @@ class MyBatisXmlParser:
                         "namespace": namespace,
                         "statement_type": stmt["tag"].upper(),
                         "operation": _operation(sql_text, stmt["tag"]),
-                        "tables": _extract_tables(sql_text),
+                        "tables": extract_tables(sql_text),
                         "parameter_type": stmt.get("parameterType"),
                         "result_type": stmt.get("resultType"),
                     },
@@ -174,13 +174,3 @@ def _operation(sql: str, tag: str) -> str:
     match = _SQL_KEYWORD.search(sql)
     return match.group(1).upper() if match else tag.upper()
 
-
-def _extract_tables(sql: str) -> list[str]:
-    pattern = re.compile(
-        r"\b(?:FROM|JOIN|INTO|UPDATE)\s+([A-Za-z_][A-Za-z0-9_\.]*)", re.IGNORECASE
-    )
-    seen: list[str] = []
-    for name in pattern.findall(sql):
-        if name.lower() not in {t.lower() for t in seen}:
-            seen.append(name)
-    return seen
