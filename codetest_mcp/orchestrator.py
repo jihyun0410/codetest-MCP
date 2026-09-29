@@ -384,12 +384,65 @@ def analyze(project_id: str, diff: str = "", sources=None) -> ChangeAnalysisResp
 # ===========================================================================
 #  3. Agent(LLM) 위임
 # ===========================================================================
+#: Agent 프롬프트가 싣는 개수 상한 (codetest-agent `testgen.py`). 넘는 몫은 보내 봐야 버려진다.
+AGENT_MAX_CHANGED_UNITS = 40
+AGENT_MAX_IMPACTED_UNITS = 30
+AGENT_MAX_LINES = 20
+
+
+def _agent_analysis(analysis: ChangeAnalysisResponse) -> dict:
+    """Agent 프롬프트가 읽는 필드만, Agent 가 자르는 길이까지만 보낸다.
+
+    중요도·경고는 MCP 가 결과에 직접 싣고 Agent 는 읽지 않는다.
+    changed_ranges 는 diff 가 비었을 때만 Agent 가 diff 대신 쓴다.
+    """
+    payload = {
+        "diff": _clip(analysis.diff),
+        "changed_units": [
+            unit.model_dump(exclude={"name", "language"}, exclude_defaults=True)
+            for unit in analysis.changed_units[:AGENT_MAX_CHANGED_UNITS]
+        ],
+        "impacted_units": [
+            unit.model_dump(exclude={"node_type"}, exclude_defaults=True)
+            for unit in analysis.impacted_units[:AGENT_MAX_IMPACTED_UNITS]
+        ],
+        # Agent 는 개수만 본다 ("여러 파일이 얽혀 있으면 하나의 테스트로")
+        "affected_files": analysis.affected_files,
+        "risk": analysis.risk,
+        "risk_score": analysis.risk_score,
+        "risk_reasons": analysis.risk_reasons,
+        "frameworks": analysis.frameworks,
+        "base_package": analysis.base_package,
+        "graph_ready": analysis.graph_ready,
+    }
+    if not analysis.diff:
+        payload["changed_ranges"] = analysis.changed_ranges
+    return payload
+
+
+def _agent_execution(facts: ExecuteResponse, reported: dict) -> dict:
+    """판정에 쓰는 실행 사실만 보낸다. 실행 출력은 Agent 가 자르는 길이까지만.
+
+    build_tool·module 은 CLI 가 보내 온 값을 그대로 넘긴다 — 빠지면 Agent 가
+    Maven 프로젝트도 Gradle 로 적는다.
+    """
+    payload = facts.model_dump(mode="json", include={
+        "exit_code", "passed", "failed", "skipped", "total",
+        "coverage", "jacoco_enabled", "springboot_applied",
+    })
+    payload["output"] = _clip(facts.output)
+    payload["failures"] = facts.failures[:AGENT_MAX_LINES]
+    payload["build_errors"] = facts.build_errors[:AGENT_MAX_LINES]
+    payload.update({key: reported[key] for key in ("build_tool", "module") if reported.get(key)})
+    return payload
+
+
 def _ask_agent_to_generate(
     snapshot: ProjectSnapshot, analysis: ChangeAnalysisResponse, pairs: list[tuple[str, str]]
 ) -> dict:
     try:
         return agent_client.generate(
-            snapshot.id, analysis.model_dump(mode="json"),
+            snapshot.id, _agent_analysis(analysis),
             _agent_payload(pairs), snapshot.name,
         ) or {}
     except AgentError as exc:
@@ -397,13 +450,12 @@ def _ask_agent_to_generate(
 
 
 def _ask_agent_to_judge(
-    project_id: str, execution: ExecuteResponse, test_code: str,
+    project_id: str, execution: dict, test_code: str,
     intent: str, intent_rationale: str,
 ) -> dict:
     try:
         return agent_client.report(
-            project_id, execution.model_dump(mode="json"),
-            test_code, intent, intent_rationale,
+            project_id, execution, _clip(test_code), intent, intent_rationale,
         ) or {}
     except AgentError as exc:
         raise FlowError(f"Agent 판정 호출 실패 — {exc}") from None
@@ -545,5 +597,7 @@ def report_execution(
         command=list(execution.get("command") or []),
         build_errors=list(execution.get("build_errors") or []),
     )
-    judged = _ask_agent_to_judge(project_id, facts, test_code, intent, intent_rationale)
+    judged = _ask_agent_to_judge(
+        project_id, _agent_execution(facts, execution), test_code, intent, intent_rationale
+    )
     return _to_report(facts, judged, analysis, intent, intent_rationale)

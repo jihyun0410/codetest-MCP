@@ -319,10 +319,55 @@ async def test_generate_hands_mcp_facts_to_the_agent(client, agent):
 
     analysis = agent.last_generate["analysis"]
     assert analysis["diff"] == DIFF                     # 원본 diff 를 그대로 넘긴다
-    assert ORDER_PATH in analysis["changed_ranges"]
     assert analysis["risk"] in {"LOW", "MEDIUM", "HIGH"}
     assert agent.last_generate["project_name"] == "demo"
     assert agent.last_generate["sources"][0]["path"] == ORDER_PATH
+    # Agent 가 읽지 않는 값은 보내지 않는다 — 중요도·경고는 MCP 가 결과에 직접 싣는다
+    assert not {"importance", "importance_rationale", "warnings", "project_id"} & analysis.keys()
+    assert "changed_ranges" not in analysis             # diff 가 있으면 Agent 는 diff 를 쓴다
+
+
+async def test_generate_sends_ranges_only_when_there_is_no_diff(client, agent):
+    """diff 가 비면 Agent 는 changed_ranges 로 변경 지점을 대신 읽는다 — 그때만 싣는다."""
+    project_id = await _register(client)
+    await _call(client, "test_generate", project_id=project_id, diff="", sources=SOURCES)
+    assert ORDER_PATH in agent.last_generate["analysis"]["changed_ranges"]
+
+
+async def test_report_sends_only_what_the_verdict_reads(client, agent):
+    """실행 출력은 Agent 가 자르는 길이까지만, 빌드 도구·모듈은 CLI 가 준 그대로."""
+    project_id = await _register(client)
+    await _call(
+        client, "report_execution", project_id=project_id,
+        execution={**LOCAL_EXECUTION, "output": "x" * 50000,
+                   "build_tool": "maven", "module": "api"},
+        test_code="class FooTest {}", diff=DIFF,
+    )
+
+    execution = agent.last_report["execution"]
+    assert len(execution["output"]) < 20100
+    assert execution["build_tool"] == "maven" and execution["module"] == "api"
+    assert not {"command", "applied", "test_file_path", "project_id"} & execution.keys()
+
+
+async def test_long_calls_send_heartbeats_while_the_agent_thinks(client, agent, monkeypatch):
+    """서버 앞단은 60초 무응답이면 Fallback 한다 — 기다리는 동안 알림을 흘려야 한다."""
+    import time
+
+    monkeypatch.setattr(settings, "heartbeat_seconds", 0.05)
+    slow = agent.generate
+    monkeypatch.setattr(agent, "generate", lambda *a, **k: (time.sleep(0.3), slow(*a, **k))[1])
+    project_id = await _register(client)
+    args = {"project_id": project_id, "diff": DIFF, "sources": SOURCES}
+
+    progress: list[str] = []
+
+    async def on_progress(value, total, message):
+        progress.append(message)
+
+    body = (await client.call_tool("test_generate", args, progress_handler=on_progress)).structured_content
+    assert len(progress) >= 2
+    assert body["intent"] == "조건 변경"                  # 알림이 결과를 가리지 않는다
 
 
 # --- CLI `codetest run` / `codetest test` — 실행은 CLI(개발자 PC)가 한다 --------

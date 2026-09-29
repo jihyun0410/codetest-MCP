@@ -34,13 +34,17 @@ MCP 가 정한다 (`importance.py`).
 
 from __future__ import annotations
 
+import asyncio
 import threading
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Annotated
+from functools import partial
+from typing import Annotated, TypeVar
 
-from fastmcp import FastMCP
+from anyio import to_thread
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_http_headers
 from fastmcp.server.middleware import Middleware, MiddlewareContext
@@ -81,6 +85,35 @@ def _flow(call, *args, **kwargs):
         return call(*args, **kwargs)
     except FlowError as exc:
         raise ToolError(str(exc)) from None
+
+
+T = TypeVar("T")
+
+
+async def _keepalive(ctx: Context, work: Callable[[], T]) -> T:
+    """work 를 스레드에서 돌리며, 끝날 때까지 CLI 쪽으로 진행 알림을 보낸다.
+
+    MCP 가 올라가는 서버는 60초 동안 오가는 메시지가 없으면 Fallback 처리한다.
+    SSE 의 `: ping` 주석은 바이트일 뿐 MCP 메시지가 아니므로, 도구 호출 스트림에
+    진짜 JSON-RPC 알림을 흘린다. 호출자가 progressToken 을 주면 진행 알림,
+    안 주면 로그 알림 — 어느 쪽이든 이 요청의 응답 스트림으로 나간다.
+    Agent 가 살아 있는지는 agent_client 가 Agent 의 ping 으로 따로 지킨다.
+    """
+    task = asyncio.ensure_future(to_thread.run_sync(work))
+    started = time.monotonic()
+    meta = ctx.request_context.meta if ctx.request_context else None
+    has_token = meta is not None and meta.progressToken is not None
+
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=settings.heartbeat_seconds)
+        if done:
+            return task.result()
+        elapsed = int(time.monotonic() - started)
+        message = f"처리 중 — {elapsed}초 경과"
+        if has_token:
+            await ctx.report_progress(elapsed, message=message)
+        else:
+            await ctx.info(message)
 
 
 # --- 백그라운드 수집 ---------------------------------------------------------
@@ -298,7 +331,8 @@ def delete_project(project_id: str) -> dict:
 
 # --- CLI 명령 흐름 -------------------------------------------------------------
 @mcp.tool()
-def test_generate(
+async def test_generate(
+    ctx: Context,
     project_id: str,
     diff: Annotated[str, Field(description="변경분 unified diff")] = "",
     sources: Annotated[
@@ -308,10 +342,12 @@ def test_generate(
     """`codetest generate` — 변경 의도를 파악하고 @SpringBootTest 를 생성한다.
 
     MCP 가 변경 단위·영향도·중요도를 확정한 뒤 Agent 에 생성을 맡긴다. 실행은 하지 않는다.
-    Agent 를 기다리는 동안 끊기지 않는 것은 `agent_client` 가 keep-alive 스트림으로
-    받기 때문이다 (CLI 쪽 SSE 는 sse-starlette 가 15초마다 ping 을 보낸다).
+    MCP↔Agent 구간은 Agent 의 keep-alive 스트림이, CLI↔MCP 구간은 `_keepalive` 의
+    진행 알림이 끊기지 않게 지킨다.
     """
-    return _flow(orchestrator.test_generate, project_id, diff, sources)
+    return await _keepalive(
+        ctx, partial(_flow, orchestrator.test_generate, project_id, diff, sources)
+    )
 
 
 @mcp.tool()
@@ -334,7 +370,8 @@ def prepare_test(
 
 
 @mcp.tool()
-def report_execution(
+async def report_execution(
+    ctx: Context,
     project_id: str,
     execution: Annotated[dict, Field(description="CLI 가 로컬에서 돌린 실행 결과")],
     test_code: Annotated[str, Field(description="실행한 Java 테스트 소스")] = "",
@@ -352,10 +389,10 @@ def report_execution(
     실행 집계는 CLI 가 준 사실을 그대로 쓰고, 기능 중요도는 MCP 가 코드로 다시
     판정하며, 결과 적절성만 Agent(LLM)가 판단한다.
     """
-    return _flow(
-        orchestrator.report_execution,
+    return await _keepalive(ctx, partial(
+        _flow, orchestrator.report_execution,
         project_id, execution, test_code, diff, sources, intent, intent_rationale,
-    )
+    ))
 
 
 # --- 실행 --------------------------------------------------------------------

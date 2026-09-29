@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     agent_stream_idle_seconds: float = Field(
         default=180.0, alias="CODETEST_MCP_AGENT_STREAM_IDLE"
     )
+    #: Agent 를 기다리는 동안 CLI 쪽으로 진행 알림을 보내는 간격(초).
+    #: MCP 가 올라가는 서버는 60초 동안 오가는 메시지가 없으면 요청을 Fallback 처리한다.
+    heartbeat_seconds: float = Field(default=10.0, alias="CODETEST_MCP_HEARTBEAT")
 
     database_url: str = Field(
         default="sqlite:///./data/codetest_mcp.db", alias="CODETEST_MCP_DATABASE_URL"
