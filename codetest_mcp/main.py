@@ -46,6 +46,8 @@ from fastmcp.server.dependencies import get_http_headers
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from pydantic import Field
 from sqlalchemy import select
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 
 from codetest_mcp import orchestrator
 from codetest_mcp.agent_client import AgentError, agent_client
@@ -175,6 +177,16 @@ mcp = FastMCP(
 
 
 # --- 연결 확인 ----------------------------------------------------------------
+@mcp.custom_route("/", methods=["GET"])
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> Response:
+    """liveness probe 용. DB·Agent·스레드풀을 건드리지 않아 Agent 대기 중에도 즉시 답한다.
+
+    probe 경로는 업로드 서버가 정하므로 루트(`/`)도 같은 응답을 준다.
+    """
+    return JSONResponse({"status": "ok"})
+
+
 @mcp.tool()
 def hello(name: str) -> str:
     """연결 확인용 에코. Agent 연결 상태도 함께 알린다."""
