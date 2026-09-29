@@ -90,6 +90,20 @@ def _flow(call, *args, **kwargs):
 T = TypeVar("T")
 
 
+def _progress_token(meta: object) -> object | None:
+    """요청 `_meta` 에서 progressToken 을 꺼낸다.
+
+    라이브러리 버전에 따라 meta 가 객체(`.progressToken`)이거나 dict
+    (`progress_token` / `progressToken`)다. 속성으로만 읽으면 dict 일 때
+    AttributeError 로 도구 호출이 시작하자마자 죽는다.
+    """
+    if meta is None:
+        return None
+    if isinstance(meta, dict):
+        return meta.get("progress_token", meta.get("progressToken"))
+    return getattr(meta, "progressToken", None)
+
+
 async def _keepalive(ctx: Context, work: Callable[[], T]) -> T:
     """work 를 스레드에서 돌리며, 끝날 때까지 CLI 쪽으로 진행 알림을 보낸다.
 
@@ -102,7 +116,7 @@ async def _keepalive(ctx: Context, work: Callable[[], T]) -> T:
     task = asyncio.ensure_future(to_thread.run_sync(work))
     started = time.monotonic()
     meta = ctx.request_context.meta if ctx.request_context else None
-    has_token = meta is not None and meta.progressToken is not None
+    has_token = _progress_token(meta) is not None
 
     while True:
         done, _ = await asyncio.wait({task}, timeout=settings.heartbeat_seconds)
