@@ -12,6 +12,7 @@ from __future__ import annotations
 import hmac
 import logging
 import sys
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
@@ -111,6 +112,28 @@ def setup_logging(level: int = logging.INFO) -> None:
 
 def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
+
+
+def trace(log: logging.Logger, message: str, *args) -> None:
+    """명령 처리 단계를 log 와 print 로 함께 남긴다.
+
+    stdio 전송에서는 stdout 이 MCP 프로토콜 채널이라 print 가 프로토콜을 깨므로
+    그때만 stderr 로 보낸다. flush 로 컨테이너 로그에 바로 보이게 한다.
+    """
+    try:
+        text = message % args if args else message
+    except (TypeError, ValueError):
+        # %s 개수와 인자 개수가 어긋난 오타가 명령 처리를 죽이면 안 된다. 원문을 그대로 남겨 오타를 드러낸다.
+        text = f"[로그 포맷 오류] {message!r} args={args!r}"
+    log.info(text)
+    stream = sys.stderr if settings.transport == "stdio" else sys.stdout
+    line = f"{time.strftime('%H:%M:%S')} | {log.name.rsplit('.', 1)[-1]} | {text}"
+    try:
+        print(line, file=stream, flush=True)
+    except UnicodeEncodeError:
+        # cp949/ascii 콘솔이 못 찍는 문자가 있어도 명령 처리를 죽이지 않는다.
+        enc = stream.encoding or "ascii"
+        print(line.encode(enc, "replace").decode(enc), file=stream, flush=True)
 
 
 def verify_api_key(provided: str | None) -> bool:

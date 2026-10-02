@@ -305,6 +305,18 @@ async def test_ingest_uses_the_snapshot_instead_of_cloning(client, monkeypatch):
         assert "Spring Boot" in project.frameworks
 
 
+async def test_register_responds_only_after_ingest_finishes(client, monkeypatch):
+    """응답은 개요 수집이 끝난 뒤에 온다 — PENDING 으로 먼저 돌려보내지 않는다."""
+    monkeypatch.setattr(main, "run_ingest", REAL_INGEST)
+
+    result = await client.call_tool("register_project", {
+        "name": "demo", "git_url": "https://github.com/acme/demo",
+        "owner": "kim", "sources": SPRING_SOURCES,
+    })
+
+    assert result.structured_content["ingest_status"] == "READY"
+
+
 async def test_ingest_falls_back_to_clone_without_a_snapshot(client, monkeypatch):
     """예전 CLI 로 등록해 스냅샷이 없으면 clone 으로 되돌아간다 (git 필요)."""
     cloned: list[bool] = []

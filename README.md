@@ -32,7 +32,7 @@ CLI(codereview_gitver)  →  MCP(codetest-MCP)  →  Agent(codetest)
 | 도구 | 설명 |
 |---|---|
 | `hello` | 연결 확인용 에코 |
-| `register_project` | 프로젝트 등록 + **커밋 소스 스냅샷 저장** + 개요 수집(백그라운드). 같은 이름·같은 git_url 로 다시 부르면 기존 프로젝트를 그대로 돌려주고 스냅샷을 갱신한다 |
+| `register_project` | 프로젝트 등록 + **커밋 소스 스냅샷 저장** + 개요 수집(**수집이 끝난 뒤 응답**, 상태는 READY/FAILED). 같은 이름·같은 git_url 로 다시 부르면 기존 프로젝트를 그대로 돌려주고 스냅샷을 갱신한다 |
 | `delete_project` | 프로젝트·그래프·작업 사본 삭제 |
 | `test_generate` | 변경 분석 + 중요도 판정 + Test Code 생성 (CLI `codetest generate`) |
 | `prepare_test` | `@SpringBootTest` 주입 + 저장 경로 계산 (실행 전 1단계) |
@@ -91,7 +91,7 @@ Agent 에 실어 보낼 파일은 이 순서로 고르고 `MAX_CONTEXT_FILES`(40
 
 ### 스냅샷은 개요 수집(AST)에도 쓴다 — **MCP 서버에 git 이 필요 없다**
 
-등록 직후 도는 개요 수집(`run_ingest` → `GraphBuilder.build_full`)은 예전에 저장소를
+등록 때 도는 개요 수집(`run_ingest` → `GraphBuilder.build_full`)은 예전에 저장소를
 clone 해서 파싱했다. 지금은 방금 저장한 스냅샷을 그대로 파싱한다. 그래서 이 서버에
 git 실행 파일도, 저장소 접근 권한도 필요 없다. `build.gradle` / `pom.xml` 같은 빌드
 파일도 스냅샷에 함께 오므로 프레임워크 판정 역시 clone 없이 된다.

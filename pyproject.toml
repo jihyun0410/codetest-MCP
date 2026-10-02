@@ -22,7 +22,7 @@ dependencies = [
 
     # --- AST 파싱 (LLM 토큰 미소모) ---
     "tree-sitter>=0.22",
-    "tree-sitter-language-pack>=0.2",  # Java/JS/TS/Python/XML/SQL 문법 번들
+    "tree-sitter-language-pack>=0.2,<1",  # 문법 번들 wheel (1.x 는 런타임 다운로드라 제외)
     "lxml>=5.2",                       # MyBatis XML 파싱
 ]
 

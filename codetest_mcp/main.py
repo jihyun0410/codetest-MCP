@@ -35,7 +35,6 @@ MCP 가 정한다 (`importance.py`).
 from __future__ import annotations
 
 import asyncio
-import threading
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -55,7 +54,7 @@ from starlette.responses import JSONResponse, Response
 
 from codetest_mcp import orchestrator
 from codetest_mcp.agent_client import AgentError, agent_client
-from codetest_mcp.config import get_logger, settings, setup_logging, verify_api_key
+from codetest_mcp.config import get_logger, settings, setup_logging, trace, verify_api_key
 from codetest_mcp.db import IngestStatus, Project, init_db, session_scope
 from codetest_mcp.graph.builder import GraphBuilder
 from codetest_mcp.orchestrator import FlowError, project_or_fail
@@ -103,20 +102,26 @@ async def _keepalive(ctx: Context, work: Callable[[], T]) -> T:
     started = time.monotonic()
     meta = ctx.request_context.meta if ctx.request_context else None
     has_token = meta is not None and meta.progressToken is not None
+    trace(
+        logger, "작업 스레드 시작 — %.0f초마다 CLI 로 %s 알림",
+        settings.heartbeat_seconds, "진행(progress)" if has_token else "로그(log)",
+    )
 
     while True:
         done, _ = await asyncio.wait({task}, timeout=settings.heartbeat_seconds)
         if done:
+            trace(logger, "작업 스레드 종료 — %.1f초", time.monotonic() - started)
             return task.result()
         elapsed = int(time.monotonic() - started)
         message = f"처리 중 — {elapsed}초 경과"
+        trace(logger, "keepalive 전송 (%s) — %d초 경과", "progress" if has_token else "log", elapsed)
         if has_token:
             await ctx.report_progress(elapsed, message=message)
         else:
             await ctx.info(message)
 
 
-# --- 백그라운드 수집 ---------------------------------------------------------
+# --- 개요 수집 (register_project 가 끝날 때까지 기다린다) ---------------------
 def run_ingest(project_id: str) -> None:
     """등록 직후: AST 파싱 → Graph 적재 → 개요 DB 저장 (정의서 상세 1).
 
@@ -124,14 +129,17 @@ def run_ingest(project_id: str) -> None:
     git 이 없어도 개요가 수집된다. 스냅샷이 없을 때만 저장소를 clone 한다
     (예전 CLI 로 등록했거나 sources 를 보내지 않은 경우).
     """
+    trace(logger, "[ingest 1/4] 개요 수집 시작: %s", project_id)
     with session_scope() as db:
         project = db.get(Project, project_id)
         if project is None:
+            trace(logger, "[ingest] 프로젝트가 없어 중단: %s", project_id)
             return
 
         project.ingest_status = IngestStatus.RUNNING.value
         project.ingest_error = None
         db.commit()
+        trace(logger, "[ingest 2/4] [%s] 상태 RUNNING 으로 변경", project.name)
 
         stored = orchestrator.committed_sources(db, project_id)
         sources = (
@@ -140,11 +148,14 @@ def run_ingest(project_id: str) -> None:
             else None
         )
         if sources is None:
-            logger.info(
+            trace(
+                logger,
                 "[%s] 커밋 스냅샷이 없어 저장소를 clone 합니다 (git 필요). "
                 "최신 CLI 로 `codetest project register` 를 다시 실행하면 clone 없이 수집됩니다.",
                 project.name,
             )
+        else:
+            trace(logger, "[ingest 3/4] 커밋 스냅샷 %d개로 AST 파싱·Graph 적재", len(sources))
 
         try:
             stats = GraphBuilder(db, project).build_full(reset=True, sources=sources)
@@ -154,8 +165,9 @@ def run_ingest(project_id: str) -> None:
             project.language_stats = stats.language_stats
             project.last_indexed_at = datetime.now(timezone.utc)
             db.commit()
-            logger.info(
-                "[%s] 개요 수집 완료 — 노드 %d, 간선 %d (%.2fs)",
+            trace(
+                logger,
+                "[ingest 4/4] [%s] 개요 수집 완료 — 노드 %d, 간선 %d (%.2fs)",
                 project.name, stats.node_count, stats.edge_count, stats.elapsed_seconds,
             )
         except Exception as exc:  # 어떤 실패든 상태에 남긴다
@@ -164,9 +176,53 @@ def run_ingest(project_id: str) -> None:
             project.ingest_error = str(exc)
             db.commit()
             logger.exception("개요 수집 실패: %s", project_id)
+            trace(logger, "[ingest] 개요 수집 실패 — 상태 FAILED: %s: %s", type(exc).__name__, exc)
 
 
-# --- 인증 --------------------------------------------------------------------
+#: 값을 로그에 남기지 않는 인자 (비밀값)
+_SECRET_ARGS = {"github_token"}
+
+
+def _summarize(arguments: dict | None) -> str:
+    """도구 인자를 로그용 한 줄로 줄인다 — 소스 본문·diff 는 길이만, 비밀값은 가린다."""
+    parts = []
+    for key, value in (arguments or {}).items():
+        if key == "git_url" and isinstance(value, str):
+            value = value.rsplit("@", 1)[-1]  # user:token@ 제거
+        if key in _SECRET_ARGS:
+            shown = "***" if value else "없음"
+        elif isinstance(value, str):
+            shown = repr(value) if len(value) <= 60 else f"<{len(value)}자>"
+        elif isinstance(value, (list, tuple)):
+            shown = f"<{len(value)}개>"
+        elif isinstance(value, dict):
+            shown = f"<키 {sorted(value)}>"
+        else:
+            shown = repr(value)
+        parts.append(f"{key}={shown}")
+    return ", ".join(parts) or "인자 없음"
+
+
+# --- 인증 · 호출 추적 -----------------------------------------------------------
+class TraceMiddleware(Middleware):
+    """모든 도구 호출의 수신·완료·실패를 남긴다 (인증 전에 걸려 거부된 호출도 보인다)."""
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        name = context.message.name
+        trace(logger, "[command 수신]: %s (%s)", name, _summarize(context.message.arguments))
+        started = time.monotonic()
+        try:
+            result = await call_next(context)
+        except Exception as exc:
+            trace(
+                logger, "[command 실패]: %s — %.1fs — %s: %s",
+                name, time.monotonic() - started, type(exc).__name__, exc,
+            )
+            raise
+        trace(logger, "[command 완료]: %s — %.1fs", name, time.monotonic() - started)
+        return result
+
+
 class ApiKeyMiddleware(Middleware):
     """HTTP 전송일 때만 X-API-Key 를 검사한다.
 
@@ -176,8 +232,13 @@ class ApiKeyMiddleware(Middleware):
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
         headers = get_http_headers()
-        if headers and not verify_api_key(headers.get("x-api-key")):
+        if not headers:
+            trace(logger, "API Key 검사 생략 — HTTP 헤더 없음(stdio)")
+        elif not verify_api_key(headers.get("x-api-key")):
+            trace(logger, "API Key 검사 실패 — 요청 거부")
             raise ToolError("유효하지 않은 API Key 입니다. X-API-Key 헤더를 확인하세요.")
+        else:
+            trace(logger, "API Key 검사 통과%s", "" if settings.api_keys else " (인증 비활성화)")
         return await call_next(context)
 
 
@@ -205,7 +266,7 @@ mcp = FastMCP(
         "Agent 에 FastAPI 로 위임한다."
     ),
     lifespan=lifespan,
-    middleware=[ApiKeyMiddleware()],
+    middleware=[TraceMiddleware(), ApiKeyMiddleware()],
 )
 
 
@@ -223,17 +284,20 @@ async def health(request: Request) -> Response:
 @mcp.tool()
 def hello(name: str) -> str:
     """연결 확인용 에코. Agent 연결 상태도 함께 알린다."""
+    trace(logger, "[hello] Agent 연결 확인")
     try:
         agent_client.health()
         agent = "ok"
     except AgentError as exc:
         agent = f"unreachable: {exc}"
+    trace(logger, "[hello] Agent 상태: %s", agent.splitlines()[0])
     return f"Hello! Test Code MCP ! {name} (agent: {agent})"
 
 
 # --- 프로젝트 개요 (정의서 상세 1) --------------------------------------------
 @mcp.tool()
-def register_project(
+async def register_project(
+    ctx: Context,
     name: Annotated[str, Field(min_length=1, max_length=200, description="프로젝트 명")],
     git_url: Annotated[str, Field(description="대상 저장소 Git URL (http(s):// 또는 git@)")],
     owner: Annotated[str, Field(min_length=1, max_length=100, description="담당자")],
@@ -244,15 +308,16 @@ def register_project(
         Field(description="이미 커밋된 소스 본문 — 이후 실행에서 변경분을 덮을 바탕이 된다"),
     ] = [],  # noqa: B006 — 읽기 전용. pydantic 이 호출마다 복사한다
 ) -> ProjectRead:
-    """프로젝트를 등록하고 Git clone + AST 개요 수집을 백그라운드로 시작한다.
+    """프로젝트를 등록하고 Git clone + AST 개요 수집을 **끝낸 뒤** 응답한다.
 
     `sources` 로 **이미 커밋된 소스 본문**을 함께 받아 저장한다. 이후 generate/run/test
     는 미커밋 변경분만 보내오는데, MCP 가 이 스냅샷 위에 그 변경분을 덮어 "현재 코드"
     를 만들어 Agent 에 넘긴다. 그래야 LLM 이 변경 지점뿐 아니라 그 코드가 호출하는
     커밋된 구현까지 보고 테스트를 만들 수 있다.
 
-    즉시 ingest_status=PENDING 으로 반환한다. 수집 완료 여부는
-    test_generate 응답의 analysis_warnings 로 알린다 (PENDING → RUNNING → READY/FAILED).
+    개요 수집(PENDING → RUNNING → READY/FAILED)이 끝난 뒤에 돌려주므로 응답의
+    ingest_status 는 READY 또는 FAILED 다 (실패 사유는 ingest_error). 수집이 길어져도
+    `_keepalive` 의 진행 알림이 CLI↔MCP 구간을 지킨다.
 
     **같은 이름·같은 git_url 로 다시 부르면 기존 프로젝트를 그대로 돌려준다.**
     CLI 는 project_id 를 로컬 `.codetest/config.json` 에만 두는데, 이 파일은
@@ -261,6 +326,35 @@ def register_project(
     "등록된 프로젝트가 없습니다" → register → "이미 있습니다" 가 무한히 반복된다.
     이 도구가 재조회 경로를 겸해야 그 고리가 끊긴다.
     """
+    return await _keepalive(ctx, partial(
+        _register_and_ingest, name, git_url, owner, github_token, default_branch, sources,
+    ))
+
+
+def _register_and_ingest(
+    name: str, git_url: str, owner: str, github_token: str | None,
+    default_branch: str, sources: list[SourceFilePayload],
+) -> ProjectRead:
+    """등록 → (필요하면) 개요 수집 → 수집 결과가 반영된 프로젝트를 돌려준다."""
+    payload, ingest_id = _register(name, git_url, owner, github_token, default_branch, sources)
+    if ingest_id is None:
+        return payload
+
+    trace(logger, "[register 4/5] 개요 수집 시작 — 끝날 때까지 CLI 응답을 보류")
+    run_ingest(ingest_id)
+    with session_scope() as db:
+        payload = _to_read(_flow(project_or_fail, db, ingest_id))
+    trace(logger, "[register 5/5] 개요 수집 종료 (상태 %s) — CLI 로 응답", payload.ingest_status)
+    return payload
+
+
+def _register(
+    name: str, git_url: str, owner: str, github_token: str | None,
+    default_branch: str, sources: list[SourceFilePayload],
+) -> tuple[ProjectRead, str | None]:
+    """프로젝트 행과 커밋 스냅샷을 저장한다. 개요 수집이 필요하면 그 project_id 를 함께 돌려준다."""
+    # URL 에 user:token@ 이 섞여 올 수 있어 '@' 앞은 로그에 남기지 않는다.
+    trace(logger, "[register 1/5] git_url 검증: %s", git_url.rsplit("@", 1)[-1])
     if not git_url.startswith(("http://", "https://", "git@")):
         raise ToolError("git_url 은 http(s):// 또는 git@ 형식이어야 합니다.")
 
@@ -268,6 +362,9 @@ def register_project(
 
     with session_scope() as db:
         existing = db.scalar(select(Project).where(Project.name == name))
+        trace(
+            logger, "[register 2/5] 이름 '%s' 조회 — %s", 
+            name, "기존 프로젝트 있음" if existing else "신규")
         if existing is not None:
             # 이름이 같아도 저장소가 다르면 진짜 충돌이다. 조용히 넘기면 엉뚱한
             # 저장소를 대상으로 테스트를 돌리게 되므로 그대로 막는다.
@@ -287,14 +384,16 @@ def register_project(
                 db, existing.id, orchestrator.as_pairs(sources)
             )
             if refreshed:
-                logger.info("[%s] 커밋 소스 %d개 갱신", existing.name, refreshed)
+                trace(logger, "[%s] 커밋 소스 %d개 갱신", existing.name, refreshed)
 
             if existing.ingest_status == IngestStatus.FAILED.value:
-                logger.info("[%s] 지난 개요 수집이 실패해 다시 시작합니다", existing.name)
-                threading.Thread(target=run_ingest, args=(existing.id,), daemon=True).start()
-            else:
-                logger.info("[%s] 이미 등록된 프로젝트를 그대로 돌려줍니다", existing.name)
-            return _to_read(existing)
+                trace(logger, "[%s] 지난 개요 수집이 실패해 다시 시작합니다", existing.name)
+                return _to_read(existing), existing.id
+            trace(
+                logger, "[%s] 이미 등록된 프로젝트를 그대로 돌려줍니다 (상태 %s)",
+                existing.name, existing.ingest_status,
+            )
+            return _to_read(existing), None
 
         project = Project(
             name=name,
@@ -307,13 +406,13 @@ def register_project(
         db.add(project)
         db.commit()
         db.refresh(project)
+        trace(logger, "[register 3/5] 프로젝트 DB 저장: id=%s", project.id)
 
         stored = orchestrator.store_committed_sources(db, project.id, orchestrator.as_pairs(sources))
         if stored:
-            logger.info("[%s] 커밋 소스 %d개 저장", project.name, stored)
+            trace(logger, "[%s] 커밋 소스 %d개 저장", project.name, stored)
 
-        threading.Thread(target=run_ingest, args=(project.id,), daemon=True).start()
-        return _to_read(project)
+        return _to_read(project), project.id
 
 
 @mcp.tool()
@@ -321,11 +420,14 @@ def delete_project(project_id: str) -> dict:
     """프로젝트와 그래프를 함께 삭제하고 작업 사본(clone)도 제거한다."""
     with session_scope() as db:
         project = _flow(project_or_fail, db, project_id)
+        trace(logger, "[delete 1/3] 프로젝트 확인: %s", project.name)
         repo = RepoService(project.id, project.git_url, project.github_token)
         db.delete(project)
         db.commit()
+        trace(logger, "[delete 2/3] DB 에서 프로젝트·그래프 삭제")
 
     repo.remove()
+    trace(logger, "[delete 3/3] 작업 사본(clone) 제거")
     return {"deleted": project_id}
 
 

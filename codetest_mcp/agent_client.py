@@ -23,7 +23,7 @@ from typing import Any
 
 import httpx
 
-from codetest_mcp.config import get_logger, settings
+from codetest_mcp.config import get_logger, settings, trace
 
 logger = get_logger(__name__)
 
@@ -65,9 +65,11 @@ class AgentClient:
 
     def _request(self, method: str, path: str, timeout: float | None = None, **kwargs) -> Any:
         url = f"{self.base_url}{path}"
+        trace(logger, "[agent-http] %s %s 요청", method, url)
         try:
             with httpx.Client(timeout=timeout or self.timeout) as client:
                 response = client.request(method, url, headers=self._headers(), **kwargs)
+            trace(logger, "[agent-http] %s %s → HTTP %d", method, url, response.status_code)
         except httpx.ConnectError as exc:
             raise AgentError(_unreachable(exc, self.base_url)) from None
         except httpx.TimeoutException:
@@ -100,17 +102,26 @@ class AgentClient:
             pool=30.0,
         )
         headers = self._headers(f"{NDJSON_MEDIA_TYPE}, application/json")
+        trace(
+            logger, "[agent-http] POST %s 요청 (본문 키 %s, 무응답 한도 %.0fs)",
+            url, sorted(payload), settings.agent_stream_idle_seconds,
+        )
 
         try:
             with (
                 httpx.Client(timeout=timeout) as client,
                 client.stream("POST", url, headers=headers, json=payload) as response,
             ):
+                trace(
+                    logger, "[agent-http] 응답 헤더 수신 — HTTP %d, %s",
+                    response.status_code, response.headers.get("content-type", "?"),
+                )
                 if response.status_code >= 400:
                     response.read()
                     raise AgentError(_extract_detail(response), response.status_code)
                 if NDJSON_MEDIA_TYPE not in response.headers.get("content-type", ""):
                     response.read()              # 예전 Agent — 평범한 JSON 응답
+                    trace(logger, "[agent-http] 예전 Agent — JSON 한 덩어리 응답 %d바이트", len(response.content))
                     return response.json() if response.content else None
                 return _last_ndjson_result(response)
         except httpx.ConnectError as exc:
@@ -207,6 +218,7 @@ def _last_ndjson_result(response: httpx.Response) -> Any:
     실제로 있다. 그때 받아 둔 결과까지 버리면 끝난 생성을 실패로 보고하게 된다.
     """
     last: dict | None = None
+    pings = 0
     try:
         for line in response.iter_lines():
             line = line.strip()
@@ -217,14 +229,20 @@ def _last_ndjson_result(response: httpx.Response) -> Any:
             except ValueError:
                 logger.debug("Agent 스트림에서 JSON 이 아닌 줄을 건너뜀: %.120s", line)
                 continue
-            if not isinstance(message, dict) or message.get("type") == "ping":
+            if isinstance(message, dict) and message.get("type") == "ping":
+                pings += 1
+                trace(logger, "[agent-stream] ping 수신 #%d", pings)
                 continue
+            if not isinstance(message, dict):
+                continue
+            trace(logger, "[agent-stream] %s 줄 수신 (%d바이트)", message.get("type", "?"), len(line))
             last = message
     except httpx.TransportError:
         if last is None:
             raise
-        logger.warning("Agent 스트림이 결과를 받은 뒤 끊겼습니다 — 받은 결과를 씁니다.")
+        trace(logger, "[agent-stream] 결과를 받은 뒤 스트림이 끊겼습니다 — 받은 결과를 씁니다.")
 
+    trace(logger, "[agent-stream] 스트림 종료 — ping %d회", pings)
     if last is None:
         raise AgentError("Agent 가 결과를 보내지 않고 응답을 끝냈습니다.")
     if last.get("type") == "error":

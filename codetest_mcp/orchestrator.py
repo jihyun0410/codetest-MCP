@@ -21,6 +21,7 @@ DB 세션은 그래프 조회 구간에만 연다. Agent 호출(LLM)과 Gradle �
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 
 from sqlalchemy import select
@@ -29,7 +30,7 @@ from sqlalchemy.orm import Session
 from codetest_mcp import importance as importance_mod
 from codetest_mcp import springboot
 from codetest_mcp.agent_client import AgentError, agent_client
-from codetest_mcp.config import get_logger
+from codetest_mcp.config import get_logger, trace
 from codetest_mcp.db import (
     GraphNode,
     IngestStatus,
@@ -278,8 +279,14 @@ def build_agent_sources(
 
     merged: list[tuple[str, str]] = []
     budget = MAX_CONTEXT_TOTAL_CHARS
+    candidates = _context_paths(analysis, changed_paths, list(overlay.values()), stored)
+    trace(
+        logger, "[context] 후보 파일 %d개 (변경 %d, 커밋 스냅샷 %d)",
+        len(candidates), len(changed_paths), len(stored),
+    )
+    skipped = 0
 
-    for path in _context_paths(analysis, changed_paths, list(overlay.values()), stored):
+    for path in candidates:
         content = overlay.get(path, stored.get(path))
         if content is None:
             continue
@@ -290,13 +297,19 @@ def build_agent_sources(
         # 우선순위가 낮더라도 들어갈 수 있는 파일을 대신 채우는 편이 낫다.
         if path not in changed_paths:
             if len(body) > budget:
+                skipped += 1
                 continue
             budget -= len(body)
         merged.append((path, body))
 
     # 그래프가 비어 영향 파일을 못 고른 경우에도 변경분은 반드시 실어 보낸다.
     if not merged:
+        trace(logger, "[context] 그래프로 고른 파일이 없어 변경분만 싣는다")
         merged = [(path, _clip(content)) for path, content in pairs]
+    trace(
+        logger, "[context] Agent 로 보낼 파일 %d개, %d자 (예산 부족으로 제외 %d개)",
+        len(merged), sum(len(body) for _, body in merged), skipped,
+    )
     return merged
 
 
@@ -315,19 +328,32 @@ def analyze(project_id: str, diff: str = "", sources=None) -> ChangeAnalysisResp
     `sources` 는 CLI 가 함께 보내는 미커밋 변경 파일 본문이다. Diff 에 hunk 가 없어
     라인 구간을 못 구한 파일은 파일 전체를 변경 구간으로 잡는 근거로 쓴다(신규 파일 등).
     """
+    started = time.monotonic()
     pairs = as_pairs(sources)
+    trace(logger, "[analyze 1/4] 시작 — diff %d자, 변경 파일 본문 %d개", len(diff), len(pairs))
 
     with session_scope() as db:
         project = project_or_fail(db, project_id)
 
         ranges = parse_diff_ranges(diff)
+        from_diff = len(ranges)
         for path, content in pairs:
             if path not in ranges:
                 ranges[path] = [(1, content.count("\n") + 1)]
+        trace(
+            logger, "[analyze 2/4] 변경 구간 — diff 에서 %d개 파일, 파일 전체로 보강 %d개",
+            from_diff, len(ranges) - from_diff,
+        )
 
         report = ImpactAnalyzer(GraphStore(db, project.id)).analyze(ranges)
         graph_ready = project.ingest_status == IngestStatus.READY.value
+        trace(
+            logger, "[analyze 3/4] 영향 분석 — 변경 단위 %d, 영향 단위 %d, 영향 파일 %d, 위험도 %s(%s), 그래프 %s",
+            len(report.changed), len(report.impacted), len(report.affected_files),
+            report.risk.value, report.score, "준비됨" if graph_ready else project.ingest_status,
+        )
         verdict = importance_mod.judge(report, graph_ready)
+        trace(logger, "[analyze 4/4] 기능 중요도 %s — 분석 %.2fs", verdict.importance, time.monotonic() - started)
 
         warnings: list[str] = []
         if not graph_ready:
@@ -440,25 +466,41 @@ def _agent_execution(facts: ExecuteResponse, reported: dict) -> dict:
 def _ask_agent_to_generate(
     snapshot: ProjectSnapshot, analysis: ChangeAnalysisResponse, pairs: list[tuple[str, str]]
 ) -> dict:
+    started = time.monotonic()
+    trace(logger, "[agent] 생성 요청 — 소스 %d개 (프로젝트 %s)", len(pairs), snapshot.name)
     try:
-        return agent_client.generate(
+        judged = agent_client.generate(
             snapshot.id, _agent_analysis(analysis),
             _agent_payload(pairs), snapshot.name,
         ) or {}
     except AgentError as exc:
+        trace(logger, "[agent] 생성 호출 실패 — %.1fs — %s", time.monotonic() - started, str(exc).splitlines()[0])
         raise FlowError(f"Agent 생성 호출 실패 — {exc}") from None
+    trace(
+        logger, "[agent] 생성 응답 수신 — %.1fs, 필드 %s, test_code %d자",
+        time.monotonic() - started, sorted(judged), len(judged.get("test_code", "") or ""),
+    )
+    return judged
 
 
 def _ask_agent_to_judge(
     project_id: str, execution: dict, test_code: str,
     intent: str, intent_rationale: str,
 ) -> dict:
+    started = time.monotonic()
+    trace(logger, "[agent] 판정 요청 — test_code %d자, 실행 결과 키 %s", len(test_code), sorted(execution))
     try:
-        return agent_client.report(
+        judged = agent_client.report(
             project_id, execution, _clip(test_code), intent, intent_rationale,
         ) or {}
     except AgentError as exc:
+        trace(logger, "[agent] 판정 호출 실패 — %.1fs — %s", time.monotonic() - started, str(exc).splitlines()[0])
         raise FlowError(f"Agent 판정 호출 실패 — {exc}") from None
+    trace(
+        logger, "[agent] 판정 응답 수신 — %.1fs, verdict=%r",
+        time.monotonic() - started, judged.get("verdict", ""),
+    )
+    return judged
 
 
 def _to_generated(
@@ -518,13 +560,19 @@ def _to_report(
 # ===========================================================================
 def test_generate(project_id: str, diff: str = "", sources=None) -> GeneratedResult:
     """`codetest generate` — 분석 → Agent 생성. 실행은 하지 않는다."""
+    trace(logger, "[generate 1/5] 시작: %s", project_id)
     pairs = as_pairs(sources)
     analysis = analyze(project_id, diff, pairs)
+    trace(logger, "[generate 2/5] 분석 완료 — 경고 %d건", len(analysis.warnings))
     snapshot = _snapshot(project_id)
+    trace(logger, "[generate 3/5] 프로젝트 스냅샷: %s (개요 상태 %s)", snapshot.name, snapshot.ingest_status)
     # 커밋된 코드에 미커밋 변경분을 덮어 "현재 코드" 를 만들어 넘긴다.
     context = build_agent_sources(project_id, analysis, pairs)
+    trace(logger, "[generate 4/5] Agent 에 생성 위임")
     judged = _ask_agent_to_generate(snapshot, analysis, context)
-    return _to_generated(analysis, judged, context)
+    result = _to_generated(analysis, judged, context)
+    trace(logger, "[generate 5/5] 결과 합치기 완료 — 중요도 %s", result.importance)
+    return result
 
 
 def prepare_test(
@@ -535,6 +583,7 @@ def prepare_test(
     실행은 **CLI 가 개발자 PC 의 프로젝트에서** 한다. 여기서 하는 일은 코드 기반
     문자열 변환뿐이라 git·JDK·Gradle 이 필요 없다 (정의서: 코드 기반 처리 = MCP).
     """
+    trace(logger, "[prepare 1/4] 시작: %s — test_code %d자", project_id, len(test_code))
     if not test_code.strip():
         raise FlowError("실행할 Test Code 가 비어 있습니다.")
 
@@ -543,13 +592,23 @@ def prepare_test(
     with session_scope() as db:
         project_or_fail(db, project_id)
         layout = project_source_layout(db, project_id)
+    trace(
+        logger, "[prepare 2/4] 소스 레이아웃 — base_package=%s, test_root=%s",
+        layout.base_package, layout.test_root,
+    )
 
     base_package_hint = layout.base_package if base_package is None else base_package
 
     try:
         prepared = springboot.prepare(test_code, base_package_hint, layout.test_root)
     except ValueError as exc:
+        trace(logger, "[prepare] @SpringBootTest 주입 실패: %s", exc)
         raise FlowError(str(exc)) from None
+    trace(
+        logger, "[prepare 3/4] @SpringBootTest 주입 — 적용 %s, 저장 경로 %s",
+        list(prepared.applied), prepared.file_path,
+    )
+    trace(logger, "[prepare 4/4] 완료")
 
     return PreparedTestResponse(
         project_id=project_id,
@@ -577,8 +636,13 @@ def report_execution(
     실행 집계는 CLI 가 준 사실을 그대로 쓰고, 기능 중요도는 MCP 가 다시 판정하며,
     결과 적절성만 Agent(LLM)에 묻는다.
     """
+    trace(
+        logger, "[report 1/4] 시작: %s — exit_code=%s, test_code %d자",
+        project_id, execution.get("exit_code"), len(test_code),
+    )
     pairs = as_pairs(sources)
     analysis = analyze(project_id, diff, pairs)
+    trace(logger, "[report 2/4] 중요도 재판정 완료 — %s", analysis.importance)
 
     facts = ExecuteResponse(
         project_id=project_id,
@@ -597,7 +661,13 @@ def report_execution(
         command=list(execution.get("command") or []),
         build_errors=list(execution.get("build_errors") or []),
     )
+    trace(
+        logger, "[report 3/4] 실행 사실 정리 — 통과 %d, 실패 %d, 건너뜀 %d, 전체 %d",
+        facts.passed, facts.failed, facts.skipped, facts.total,
+    )
     judged = _ask_agent_to_judge(
         project_id, _agent_execution(facts, execution), test_code, intent, intent_rationale
     )
-    return _to_report(facts, judged, analysis, intent, intent_rationale)
+    result = _to_report(facts, judged, analysis, intent, intent_rationale)
+    trace(logger, "[report 4/4] 리포트 합치기 완료 — %s", result.result)
+    return result

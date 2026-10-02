@@ -5,5 +5,5 @@ SQLAlchemy>=2.0
 httpx>=0.27
 GitPython>=3.1        # 스냅샷 없는 예전 프로젝트를 clone 할 때만 쓴다
 tree-sitter>=0.22
-tree-sitter-language-pack>=0.2
+tree-sitter-language-pack>=0.2,<1   # 1.x 는 문법을 런타임에 GitHub 에서 내려받아 폐쇄망/프록시에서 실패
 lxml>=5.2
