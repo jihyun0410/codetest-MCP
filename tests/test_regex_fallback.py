@@ -66,28 +66,35 @@ def test_js_blank_lines_do_not_blow_up():
 
 
 def test_fallback_still_extracts_types_methods_and_constructors():
-    source = (
-        "package com.example;\n"                                   # 1
-        "\n"                                                       # 2
-        "public class OrderController {\n"                         # 3
-        "    private final Svc svc;\n"                             # 4
-        "\n"                                                       # 5
-        "    @GetMapping(\"/{id}\")\n"                             # 6
-        "    public Map<String, List<Integer>> get(Long id) throws IOException {\n"  # 7
-        "        validate(id);\n"                                  # 8  호출문 — 메서드가 아니다
-        "        return null;\n"                                   # 9
-        "    }\n"                                                  # 10
-        "\n"                                                       # 11
-        "    private void validate(Long id) {}\n"                  # 12
-        "    OrderController(Svc s) { this.svc = s; }\n"           # 13 수식어 없는 생성자
-        "}\n"
-    )
+    # 파일 하나의 내용일 뿐이다 — 폴백은 경로가 아니라 이 텍스트만 보고 노드를 만든다.
+    # 기대 줄 번호는 아래 목록에서 찾아 계산하므로 샘플을 고쳐도 숫자를 따로 맞출 필요가 없다.
+    lines = [
+        "package com.example;",
+        "",
+        "public class OrderController {",
+        "    private final Svc svc;",
+        "",
+        '    @GetMapping("/{id}")',
+        "    public Map<String, List<Integer>> get(Long id) throws IOException {",
+        "        validate(id);",          # 호출문 — 메서드가 아니다
+        "        return null;",
+        "    }",
+        "",
+        "    private void validate(Long id) {}",
+        "    OrderController(Svc s) { this.svc = s; }",    # 수식어 없는 생성자
+        "}",
+    ]
 
-    result = java_parser._regex_fallback("src/OrderController.java", source)
+    def line_of(text: str) -> int:
+        return next(no for no, line in enumerate(lines, 1) if text in line)
 
-    by_name = {n.name: n for n in result.nodes if n.node_type.name != "FILE"}
-    assert set(by_name) == {"OrderController", "get", "validate"}
-    assert by_name["OrderController"].start_line in {3, 13}   # 클래스 선언 또는 생성자
-    assert by_name["get"].start_line == 6                     # 애너테이션 줄부터
-    assert by_name["validate"].start_line == 12               # 앞 빈 줄이 아니라 선언 줄
-    assert {n.signature for n in result.nodes if n.name == "OrderController"} >= {"class com.example.OrderController"}
+    result = java_parser._regex_fallback("A.java", "\n".join(lines) + "\n")
+
+    # 클래스와 생성자는 이름이 같으므로 이름이 아니라 (종류, 이름, 시작 줄) 전체로 비교한다.
+    found = [(n.node_type.name, n.name, n.start_line) for n in result.nodes if n.node_type.name != "FILE"]
+    assert found == [
+        ("CLASS", "OrderController", line_of("public class")),
+        ("METHOD", "get", line_of("@GetMapping")),           # 애너테이션 줄부터
+        ("METHOD", "validate", line_of("void validate")),    # 앞 빈 줄이 아니라 선언 줄
+        ("METHOD", "OrderController", line_of("OrderController(Svc")),
+    ]
