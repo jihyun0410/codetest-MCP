@@ -17,7 +17,14 @@ from __future__ import annotations
 import re
 
 from codetest_mcp.db import EdgeType, NodeType
-from codetest_mcp.parsing.base import ParseResult, ParsedEdge, ParsedNode, extract_tables, join_route
+from codetest_mcp.parsing.base import (
+    ParseResult,
+    ParsedEdge,
+    ParsedNode,
+    extract_tables,
+    join_route,
+    line_finder,
+)
 from codetest_mcp.parsing.tree_sitter_loader import (
     child_by_field,
     field_text,
@@ -583,16 +590,25 @@ def _sql_signature(sql: str, limit: int = 160) -> str:
 # ---------------------------------------------------------------------------
 #  Tree-sitter 미설치 환경용 정규식 폴백
 # ---------------------------------------------------------------------------
-_RE_PACKAGE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.MULTILINE)
+# 폭주 방지: `\s` 는 줄바꿈까지 먹으므로 `\s*(?:…|\s)*`, `[…\s]+\s+` 처럼 서로 겹치는 반복을
+# 두면 매칭 실패 때 모든 분할을 시도해 상수만 나열한 enum 같은 파일에서 수십 초가 걸린다.
+# 반복마다 첫 글자가 갈리게(토큰 + 공백) 쓰고, 수식어·반환형은 한 줄 안으로 제한한다.
+_RE_PACKAGE = re.compile(r"^[ \t]*package\s+([\w.]+)\s*;", re.MULTILINE)
 _RE_TYPE = re.compile(
-    r"^\s*(?:public|protected|private|abstract|final|static|\s)*"
-    r"(class|interface|enum|record)\s+(\w+)",
+    r"^[ \t]*(?:(?:public|protected|private|abstract|final|static)[ \t]+)*"
+    r"(class|interface|enum|record)[ \t]+(\w+)",
     re.MULTILINE,
 )
 _RE_METHOD = re.compile(
-    r"^[ \t]*(?:@\w+[^\n]*\n[ \t]*)*"
-    r"(?:public|protected|private|static|final|synchronized|abstract|native|\s)+"
-    r"[\w<>\[\],.?\s]+\s+(\w+)\s*\(([^)]*)\)\s*(?:throws [\w,\s.]+)?\s*[{;]",
+    r"^[ \t]*(?:@\w+[^\n]*\n[ \t]*)*"                 # 앞 줄의 애너테이션
+    r"(?:[\w<>\[\].?,]+[ \t]+)+(\w+)[ \t]*\(([^)]*)\)"  # 수식어·반환형 토큰들 + 이름 + 인자
+    r"\s*(?:throws\s[^{;]*)?[{;]",
+    re.MULTILINE,
+)
+# 수식어 없는 생성자(`Foo(int a) {`, enum 의 `E(String d) {`). 반환형 토큰이 없어 위 정규식에 안 걸린다.
+# 호출문(`validate(o);`)과 구분하려고 대문자로 시작하는 이름 + `{` 로 끝나는 경우만 잡는다.
+_RE_CTOR = re.compile(
+    r"^[ \t]*(?:@\w+[^\n]*\n[ \t]*)*([A-Z]\w*)[ \t]*\(([^)]*)\)\s*(?:throws\s[^{;]*)?\{",
     re.MULTILINE,
 )
 
@@ -604,6 +620,7 @@ def _regex_fallback(file_path: str, source: str) -> ParseResult:
     호출 관계(Calls)까지는 신뢰할 수 없으므로 Contains 만 생성한다.
     """
     result = ParseResult()
+    line_of = line_finder(source)
     package_match = _RE_PACKAGE.search(source)
     package = package_match.group(1) if package_match else ""
 
@@ -627,7 +644,7 @@ def _regex_fallback(file_path: str, source: str) -> ParseResult:
     for type_match in _RE_TYPE.finditer(source):
         class_name = type_match.group(2)
         class_qname = f"{package}.{class_name}" if package else class_name
-        line_no = source[: type_match.start()].count("\n") + 1
+        line_no = line_of(type_match.start())
         result.nodes.append(
             ParsedNode(
                 node_type=NodeType.CLASS,
@@ -646,11 +663,12 @@ def _regex_fallback(file_path: str, source: str) -> ParseResult:
             ParsedEdge(file_qname, EdgeType.CONTAINS, target_qname=class_qname)
         )
 
-        for method_match in _RE_METHOD.finditer(source):
+        found = [*_RE_METHOD.finditer(source), *_RE_CTOR.finditer(source)]
+        for method_match in sorted(found, key=lambda m: m.start()):
             mname = method_match.group(1)
             if mname in {"if", "for", "while", "switch", "catch", "return", "new"}:
                 continue
-            mline = source[: method_match.start()].count("\n") + 1
+            mline = line_of(method_match.start())
             mqname = f"{class_qname}#{mname}()"
             result.nodes.append(
                 ParsedNode(

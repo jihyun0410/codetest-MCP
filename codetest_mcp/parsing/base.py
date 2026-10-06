@@ -10,10 +10,21 @@ from __future__ import annotations
 import re
 
 import hashlib
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from codetest_mcp.db import EdgeType, NodeType
+
+
+def line_finder(source: str):
+    """문자 오프셋 → 1부터 시작하는 줄 번호를 돌려주는 함수.
+
+    정규식 폴백에서 매치마다 `source[:start].count("\\n")` 을 세면 메서드가 많은 파일에서
+    제곱으로 느려진다. 줄바꿈 위치를 한 번만 모아 두고 이분 탐색한다.
+    """
+    newlines = [m.start() for m in re.finditer("\n", source)]
+    return lambda offset: bisect_left(newlines, offset) + 1
 
 
 def fingerprint(text: str) -> str:

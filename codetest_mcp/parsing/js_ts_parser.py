@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 
 from codetest_mcp.db import EdgeType, NodeType
-from codetest_mcp.parsing.base import ParseResult, ParsedEdge, ParsedNode, join_route
+from codetest_mcp.parsing.base import ParseResult, ParsedEdge, ParsedNode, join_route, line_finder
 from codetest_mcp.parsing.tree_sitter_loader import (
     child_by_field,
     field_text,
@@ -356,15 +356,20 @@ def _sql_operation(sql: str) -> str:
 # ---------------------------------------------------------------------------
 #  정규식 폴백
 # ---------------------------------------------------------------------------
-_RE_JS_CLASS = re.compile(r"^\s*(?:export\s+)?(?:abstract\s+)?class\s+(\w+)", re.MULTILINE)
+# `^\s*` 는 빈 줄이 많으면 줄마다 끝까지 먹어 제곱으로 느려진다 — 줄 안의 공백만 허용한다.
+_RE_JS_CLASS = re.compile(
+    r"^[ \t]*(?:export[ \t]+)?(?:abstract[ \t]+)?class[ \t]+(\w+)", re.MULTILINE
+)
 _RE_JS_FUNC = re.compile(
-    r"^\s*(?:export\s+)?(?:async\s+)?(?:function\s+(\w+)|const\s+(\w+)\s*=\s*(?:async\s*)?\()",
+    r"^[ \t]*(?:export[ \t]+)?(?:async[ \t]+)?"
+    r"(?:function[ \t]+(\w+)|const[ \t]+(\w+)[ \t]*=[ \t]*(?:async[ \t]*)?\()",
     re.MULTILINE,
 )
 
 
 def _regex_fallback(file_path: str, source: str, language: str) -> ParseResult:
     result = ParseResult()
+    line_of = line_finder(source)
     module = _module_id(file_path)
     file_qname = f"file:{file_path}"
     result.nodes.append(
@@ -391,7 +396,7 @@ def _regex_fallback(file_path: str, source: str, language: str) -> ParseResult:
                 qualified_name=qname,
                 file_path=file_path,
                 language=language,
-                start_line=source[: match.start()].count("\n") + 1,
+                start_line=line_of(match.start()),
                 signature=f"class {name}",
                 meta={"degraded": True},
             )
@@ -409,7 +414,7 @@ def _regex_fallback(file_path: str, source: str, language: str) -> ParseResult:
                 qualified_name=qname,
                 file_path=file_path,
                 language=language,
-                start_line=source[: match.start()].count("\n") + 1,
+                start_line=line_of(match.start()),
                 signature=f"{name}(...)",
                 meta={"degraded": True},
             )
